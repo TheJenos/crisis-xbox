@@ -1,0 +1,33 @@
+# Allow-list: only source written for this project is tracked.
+# The disc image, files extracted from it, code generated from the game
+# (recomp/ppc*), builds (web/, build*/), dumps and third-party tools stay out.
+/*
+!/.gitignore
+!/README.md
+
+!/recomp/
+/recomp/*
+!/recomp/runtime/
+/recomp/runtime/stubs.gen.cpp
+!/recomp/web-src/
+!/recomp/config/
+!/recomp/overlay-template/
+!/recomp/build_web.sh
+!/recomp/build_web_variant.sh
+!/recomp/build.sh
+!/recomp/serve.py
+
+!/analysis/
+/analysis/*
+!/analysis/*.py
+!/analysis/*.cpp
+!/analysis/*.h
+!/analysis/leaf_functions.toml
+!/analysis/XenonRecomp-crysis2.patch
+!/analysis/insn_tests/
+/analysis/insn_tests/*
+!/analysis/insn_tests/*.cpp
+!/analysis/insn_tests/generated.inc
+!/analysis/diag/
+/analysis/diag/*
+!/analysis/diag/*.cpp

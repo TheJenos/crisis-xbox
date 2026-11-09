@@ -1,0 +1,1447 @@
+diff --git a/XenonAnalyse/function.cpp b/XenonAnalyse/function.cpp
+index 34add40..7feb125 100644
+--- a/XenonAnalyse/function.cpp
++++ b/XenonAnalyse/function.cpp
+@@ -98,6 +98,14 @@ Function Function::Analyze(const void* code, size_t size, size_t base)
+                 continue;
+             }
+ 
++            // A branch to the next instruction has the same destination on both paths.
++            // Treating it as a split would give the fallthrough block a projected size of 0,
++            // dropping it from the function and cutting the function short.
++            if (PPC_BD(instruction) == 4)
++            {
++                continue;
++            }
++
+             // TODO: carry projections over to false
+             curBlock.projectedSize = -1;
+             blockStack.pop_back();
+diff --git a/XenonAnalyse/main.cpp b/XenonAnalyse/main.cpp
+index d08371e..0e6d139 100644
+--- a/XenonAnalyse/main.cpp
++++ b/XenonAnalyse/main.cpp
+@@ -6,6 +6,10 @@
+ #include <xbox.h>
+ #include <fmt/core.h>
+ #include "function.h"
++#include <algorithm>
++#include <cstring>
++#include <set>
++#include <unordered_map>
+ 
+ #define SWITCH_ABSOLUTE 0
+ #define SWITCH_COMPUTED 1
+@@ -19,6 +23,8 @@ struct SwitchTable
+     size_t defaultLabel{};
+     uint32_t r{};
+     uint32_t type{};
++    uint32_t tableAddress{}; // generic scan only: address and entry size of the table data
++    uint32_t elemSize{};
+ };
+ 
+ void ReadTable(Image& image, SwitchTable& table)
+@@ -172,6 +178,590 @@ void* SearchMask(const void* source, const uint32_t* compare, size_t compareCoun
+     return nullptr;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Generic jump table detection.
++//
++// The fixed instruction patterns above only match when the compiler emits the
++// table setup as one contiguous sequence. Newer XDK compilers interleave those
++// instructions with the bounds check and pad them with nops, so instead we
++// start at every bctr and evaluate the value moved into CTR symbolically,
++// walking backwards through the instructions that define each register.
++// ---------------------------------------------------------------------------
++
++struct SymValue
++{
++    enum Kind { Unknown, Const, Index, Addr, Load } kind{ Unknown };
++    uint32_t c{};        // Const: value. Addr/Load: table address
++    uint32_t reg{};      // Index/Addr/Load: index register
++    uint32_t scale{ 1 }; // Index/Addr/Load: multiplier applied to the index register
++    uint32_t elemSize{}; // Load: 1, 2 or 4 bytes
++    uint32_t shift{};    // Load: left shift applied to the loaded value
++    bool hasBase{};      // Load: a constant was added to the (shifted) loaded value
++    uint32_t base{};
++};
++
++struct GenericScanner
++{
++    static constexpr size_t MaxBacktrack = 64;
++
++    const uint32_t* code; // section data (big-endian words)
++    size_t sectionBase;
++    size_t count;         // instructions in section
++
++    bool Decode(size_t i, ppc_insn& insn) const
++    {
++        ppc::Disassemble(&code[i], sectionBase + i * 4, insn);
++        return insn.opcode != nullptr;
++    }
++
++    static bool StartsWith(const char* s, const char* p) { return strncmp(s, p, strlen(p)) == 0; }
++
++    // Unconditional control flow ends the straight-line region we can reason about.
++    static bool EndsBlock(const ppc_insn& insn)
++    {
++        const char* n = insn.opcode->name;
++        return strcmp(n, "b") == 0 || strcmp(n, "blr") == 0 || strcmp(n, "bctr") == 0;
++    }
++
++    // Does this instruction write general purpose register `reg`?
++    static bool Writes(const ppc_insn& insn, uint32_t reg)
++    {
++        const char* n = insn.opcode->name;
++        size_t len = strlen(n);
++
++        // Calls clobber the volatile registers.
++        if (strcmp(n, "bl") == 0 || strcmp(n, "bctrl") == 0 || strcmp(n, "blrl") == 0)
++            return reg == 0 || (reg >= 3 && reg <= 12);
++
++        // Instructions that don't write a GPR, or write FPR/VR/CR/SPR destinations.
++        if (n[0] == 'b' || StartsWith(n, "cmp") || StartsWith(n, "mt") || StartsWith(n, "tw") ||
++            StartsWith(n, "td") || StartsWith(n, "dcb") || StartsWith(n, "icb") || StartsWith(n, "sync") ||
++            StartsWith(n, "isync") || StartsWith(n, "eieio") || StartsWith(n, "lwsync") || strcmp(n, "nop") == 0 ||
++            n[0] == 'f' || n[0] == 'v' || StartsWith(n, "lf") || StartsWith(n, "lv") || StartsWith(n, "stv") ||
++            StartsWith(n, "stf") || StartsWith(n, "cr") || StartsWith(n, "mcrf"))
++        {
++            // Floating/vector loads and stores with update still write their base register.
++            if ((StartsWith(n, "lf") || StartsWith(n, "stf")) && (n[len - 1] == 'u' || (len > 2 && strcmp(n + len - 2, "ux") == 0)))
++                return (n[len - 1] == 'u' ? insn.operands[2] : insn.operands[1]) == reg;
++            return false;
++        }
++
++        // Integer stores only write their base register in update form.
++        if (StartsWith(n, "st"))
++        {
++            if (n[len - 1] == 'u')
++                return insn.operands[2] == reg;
++            if (len > 2 && strcmp(n + len - 2, "ux") == 0)
++                return insn.operands[1] == reg;
++            if (strcmp(n + len - 2, "x.") == 0 || n[len - 1] == '.') // stwcx. writes CR only
++                return false;
++            return false;
++        }
++
++        // Integer loads with update write both rD and the base register.
++        if (n[0] == 'l' && (n[len - 1] == 'u' || (len > 2 && strcmp(n + len - 2, "ux") == 0)))
++            return insn.operands[0] == reg || (n[len - 1] == 'u' ? insn.operands[2] : insn.operands[1]) == reg;
++
++        return insn.operands[0] == reg;
++    }
++
++    // Find the closest instruction before `pos` that writes `reg`.
++    // Returns SIZE_MAX if the region ends first (register is live-in).
++    size_t FindDef(size_t pos, uint32_t reg, size_t limit) const
++    {
++        ppc_insn insn;
++        for (size_t k = 1; k <= limit && k <= pos; k++)
++        {
++            size_t i = pos - k;
++            if (!Decode(i, insn))
++                return SIZE_MAX;
++            if (EndsBlock(insn))
++                return SIZE_MAX;
++            if (Writes(insn, reg))
++                return i;
++        }
++        return SIZE_MAX;
++    }
++
++    SymValue Eval(size_t pos, uint32_t reg, int depth = 0) const
++    {
++        SymValue v{};
++        if (depth > 12)
++            return v;
++
++        size_t def = FindDef(pos, reg, MaxBacktrack);
++        if (def == SIZE_MAX)
++        {
++            v.kind = SymValue::Index; // a value from outside the region: the switch index candidate
++            v.reg = reg;
++            return v;
++        }
++
++        ppc_insn insn;
++        Decode(def, insn);
++        const char* n = insn.opcode->name;
++
++        // Anything we can't interpret is an opaque value held in `reg`, which can
++        // still serve as the switch index. FindBound verifies the bounds check
++        // compares this same register and that it survives until the bctr.
++        v = { SymValue::Index, 0, reg };
++        const uint32_t* op = insn.operands;
++
++        if (strcmp(n, "lis") == 0)
++            return { SymValue::Const, op[1] << 16 };
++        if (strcmp(n, "li") == 0)
++            return { SymValue::Const, op[1] };
++        if (strcmp(n, "addi") == 0 || strcmp(n, "addis") == 0)
++        {
++            uint32_t imm = strcmp(n, "addis") == 0 ? op[2] << 16 : op[2];
++            if (op[1] == 0)
++                return { SymValue::Const, imm };
++            SymValue a = Eval(def, op[1], depth + 1);
++            if (a.kind == SymValue::Const)
++                return { SymValue::Const, a.c + imm };
++            return v;
++        }
++        if (strcmp(n, "ori") == 0)
++        {
++            SymValue a = Eval(def, op[1], depth + 1);
++            if (a.kind == SymValue::Const)
++                return { SymValue::Const, a.c | op[2] };
++            return v;
++        }
++        if (strcmp(n, "mr") == 0)
++            return Eval(def, op[1], depth + 1);
++        if (strcmp(n, "rlwinm") == 0 || strcmp(n, "slwi") == 0)
++        {
++            uint32_t sh = op[2];
++            // Only a plain left shift: rlwinm rD, rS, sh, 0, 31-sh
++            if (strcmp(n, "rlwinm") == 0 && !(op[3] == 0 && op[4] == 31 - sh))
++                return v;
++            SymValue a = Eval(def, op[1], depth + 1);
++            if (a.kind == SymValue::Const)
++                return { SymValue::Const, a.c << sh };
++            if (a.kind == SymValue::Index)
++            {
++                a.scale <<= sh;
++                return a;
++            }
++            if (a.kind == SymValue::Load && !a.hasBase)
++            {
++                a.shift += sh;
++                return a;
++            }
++            return v;
++        }
++        if (strcmp(n, "add") == 0)
++        {
++            SymValue a = Eval(def, op[1], depth + 1);
++            SymValue b = Eval(def, op[2], depth + 1);
++            if (b.kind == SymValue::Const)
++                std::swap(a, b);
++            if (a.kind != SymValue::Const)
++                return v;
++            if (b.kind == SymValue::Const)
++                return { SymValue::Const, a.c + b.c };
++            if (b.kind == SymValue::Index)
++            {
++                b.kind = SymValue::Addr;
++                b.c = a.c;
++                return b;
++            }
++            if (b.kind == SymValue::Load && !b.hasBase)
++            {
++                b.hasBase = true;
++                b.base = a.c;
++                return b;
++            }
++            return v;
++        }
++        if (strcmp(n, "lwzx") == 0 || strcmp(n, "lhzx") == 0 || strcmp(n, "lbzx") == 0)
++        {
++            uint32_t elem = n[1] == 'w' ? 4 : n[1] == 'h' ? 2 : 1;
++            if (op[1] == 0)
++                return v;
++            SymValue a = Eval(def, op[1], depth + 1);
++            SymValue b = Eval(def, op[2], depth + 1);
++            if (b.kind == SymValue::Const)
++                std::swap(a, b);
++            if (a.kind != SymValue::Const || b.kind != SymValue::Index || b.scale != elem)
++                return v;
++            SymValue r{};
++            r.kind = SymValue::Load;
++            r.c = a.c;
++            r.reg = b.reg;
++            r.elemSize = elem;
++            return r;
++        }
++        if (strcmp(n, "lwz") == 0 || strcmp(n, "lhz") == 0 || strcmp(n, "lbz") == 0)
++        {
++            uint32_t elem = n[1] == 'w' ? 4 : n[1] == 'h' ? 2 : 1;
++            if (op[2] == 0)
++                return v;
++            SymValue a = Eval(def, op[2], depth + 1);
++            if (a.kind != SymValue::Addr || a.scale != elem)
++                return v;
++            a.kind = SymValue::Load;
++            a.c += op[1];
++            a.elemSize = elem;
++            return a;
++        }
++        return v;
++    }
++
++    // Instruction index range of the function containing the jump, used when
++    // following branches back to the bounds check.
++    size_t fnStart{};
++    size_t fnEnd{};
++
++    static constexpr size_t MaxBoundBacktrack = 256;
++    static constexpr int MaxBoundDepth = 4;
++
++    // From the conditional branch at `pos` on `cr`, find the cmplwi that set it.
++    // `inclusive` is 1 for gt/le branches (index <= max) and 0 for lt (index < max).
++    bool FindCompare(size_t pos, uint32_t cr, uint32_t idxReg, uint32_t inclusive, SwitchTable& table) const
++    {
++        ppc_insn insn;
++        for (size_t k = 1; k <= MaxBoundBacktrack && k <= pos && pos - k >= fnStart; k++)
++        {
++            size_t i = pos - k;
++            if (!Decode(i, insn))
++                continue;
++            if (EndsBlock(insn))
++                return false;
++            uint32_t id = insn.opcode->id;
++            if (id == PPC_INST_CMPLWI && insn.operands[0] == cr)
++            {
++                if (insn.operands[1] != idxReg || insn.operands[2] + inclusive == 0)
++                    return false;
++                table.r = idxReg;
++                table.labels.resize(insn.operands[2] + inclusive);
++                return true;
++            }
++            // Some other compare into the same CR field means this isn't a bounds check.
++            if (StartsWith(insn.opcode->name, "cmp") && insn.operands[0] == cr)
++                return false;
++            if (Writes(insn, idxReg))
++                return false;
++        }
++        return false;
++    }
++
++    // Locate the bounds check (cmplwi crN, rIdx, max / bgt crN) guarding the jump
++    // at `pos`. If the table setup is its own basic block, follow the branches
++    // that enter it. Fails if the index register is overwritten on the way, since
++    // the switch statement reads it at the bctr.
++    bool FindBound(size_t pos, uint32_t idxReg, SwitchTable& table, int depth = 0) const
++    {
++        ppc_insn insn;
++        for (size_t k = 1; k <= MaxBoundBacktrack && k <= pos && pos - k >= fnStart; k++)
++        {
++            size_t i = pos - k;
++            if (!Decode(i, insn))
++                continue;
++            if (EndsBlock(insn))
++                return depth < MaxBoundDepth && FindBoundFromPredecessors(i + 1, idxReg, table, depth + 1);
++
++            uint32_t id = insn.opcode->id;
++            if (id == PPC_INST_BGT || id == PPC_INST_BGTLR || id == PPC_INST_BLE || id == PPC_INST_BLELR)
++            {
++                if (id == PPC_INST_BGT)
++                    table.defaultLabel = insn.operands[1];
++                return FindCompare(i, insn.operands[0], idxReg, 1, table);
++            }
++            if (Writes(insn, idxReg))
++                return false;
++        }
++        return false;
++    }
++
++    // `blockStart` can't be reached by falling through, so search the function for
++    // branches into it: `ble/blt crN, block` is itself the bounds check, and an
++    // unconditional `b block` means the check is further up that path.
++    bool FindBoundFromPredecessors(size_t blockStart, uint32_t idxReg, SwitchTable& table, int depth) const
++    {
++        uint32_t target = uint32_t(sectionBase + blockStart * 4);
++        ppc_insn insn;
++        for (size_t j = fnStart; j < fnEnd; j++)
++        {
++            uint32_t w = ByteSwap(code[j]);
++            uint32_t primary = w >> 26;
++            if (primary != 16 && primary != 18) // bc / b
++                continue;
++            if (!Decode(j, insn))
++                continue;
++
++            uint32_t id = insn.opcode->id;
++            if (id == PPC_INST_B && insn.operands[0] == target)
++            {
++                if (FindBound(j, idxReg, table, depth))
++                    return true;
++            }
++            else if ((id == PPC_INST_BLE || id == PPC_INST_BLT) && insn.operands[1] == target)
++            {
++                if (FindCompare(j, insn.operands[0], idxReg, id == PPC_INST_BLE ? 1 : 0, table))
++                    return true;
++            }
++        }
++
++        // Nested switch: the block is a case of an already-resolved jump table,
++        // so the check may be on the path into that outer switch.
++        if (caseSources != nullptr)
++        {
++            auto [begin, end] = caseSources->equal_range(target);
++            for (auto it = begin; it != end; ++it)
++            {
++                size_t outer = (it->second - sectionBase) / 4;
++                if (outer >= fnStart && outer < fnEnd && FindBound(outer, idxReg, table, depth))
++                    return true;
++            }
++        }
++        return false;
++    }
++
++    // Case label -> bctr address of the jump tables resolved so far.
++    const std::unordered_multimap<uint32_t, uint32_t>* caseSources{};
++};
++
++struct GenericScanStats
++{
++    size_t bctr{}, notTable{}, noBound{}, badLabels{}, found{};
++};
++
++static void ScanGenericTables(Image& image, std::vector<SwitchTable>& switches, GenericScanStats& stats)
++{
++    // Function ranges from .pdata, used to sanity check labels.
++    std::vector<std::pair<uint32_t, uint32_t>> functions;
++    if (const Section* pdata = image.Find(".pdata"))
++    {
++        auto* pf = (const IMAGE_CE_RUNTIME_FUNCTION*)pdata->data;
++        for (size_t i = 0; i < pdata->size / sizeof(IMAGE_CE_RUNTIME_FUNCTION); i++)
++        {
++            IMAGE_CE_RUNTIME_FUNCTION fn = pf[i];
++            fn.BeginAddress = ByteSwap(fn.BeginAddress);
++            fn.Data = ByteSwap(fn.Data);
++            if (fn.BeginAddress != 0)
++                functions.emplace_back(fn.BeginAddress, fn.BeginAddress + fn.FunctionLength * 4);
++        }
++        std::sort(functions.begin(), functions.end());
++    }
++
++    auto findFunction = [&](uint32_t addr) -> const std::pair<uint32_t, uint32_t>*
++        {
++            auto it = std::upper_bound(functions.begin(), functions.end(), std::make_pair(addr, UINT32_MAX));
++            if (it == functions.begin())
++                return nullptr;
++            --it;
++            return addr < it->second ? &*it : nullptr;
++        };
++
++    std::unordered_multimap<uint32_t, uint32_t> caseSources;
++
++    enum class Result { NotTable, NoBound, BadLabels, Found };
++
++    // Try to resolve the jump table ending in the bctr at instruction `i`.
++    auto tryTable = [&](const Section& section, GenericScanner& scanner, size_t i, SwitchTable& table) -> Result
++        {
++            // Find the mtctr feeding this bctr.
++            ppc_insn insn;
++            size_t mtctrPos = SIZE_MAX;
++            for (size_t k = 1; k <= 8 && k <= i; k++)
++            {
++                if (!scanner.Decode(i - k, insn))
++                    break;
++                if (insn.opcode->id == PPC_INST_MTCTR)
++                {
++                    mtctrPos = i - k;
++                    break;
++                }
++                if (GenericScanner::EndsBlock(insn))
++                    break;
++            }
++            if (mtctrPos == SIZE_MAX)
++                return Result::NotTable;
++
++            uint32_t ctrReg = insn.operands[0];
++            uint32_t bctrAddr = uint32_t(section.base + i * 4);
++            const auto* fn = findFunction(bctrAddr);
++            if (fn != nullptr && fn->first >= section.base && fn->second <= section.base + section.size)
++            {
++                scanner.fnStart = (fn->first - section.base) / 4;
++                scanner.fnEnd = (fn->second - section.base) / 4;
++            }
++            else
++            {
++                // No unwind info (leaf function): only look nearby.
++                scanner.fnStart = i > 4096 ? i - 4096 : 0;
++                scanner.fnEnd = std::min(scanner.count, i + 4096);
++            }
++
++            // Fallback for absolute tables placed inline right after the bctr with no
++            // bounds check (every path into the block sets the index, sometimes as a
++            // constant). The table then runs up to the first case label.
++            auto tryInlineTable = [&]() -> bool
++                {
++                    size_t def = scanner.FindDef(mtctrPos, ctrReg, GenericScanner::MaxBacktrack);
++                    ppc_insn load;
++                    if (def == SIZE_MAX || !scanner.Decode(def, load) || load.opcode->id != PPC_INST_LWZX)
++                        return false;
++                    for (int order = 0; order < 2; order++)
++                    {
++                        uint32_t baseReg = load.operands[order ? 2 : 1], idxReg = load.operands[order ? 1 : 2];
++                        SymValue b = scanner.Eval(def, baseReg);
++                        if (b.kind != SymValue::Const || b.c != bctrAddr + 4)
++                            continue;
++                        // Index scaled by 4: rlwinm rIdxScaled, rIdx, 2, 0, 29
++                        size_t sdef = scanner.FindDef(def, idxReg, GenericScanner::MaxBacktrack);
++                        ppc_insn shift;
++                        if (sdef == SIZE_MAX || !scanner.Decode(sdef, shift) || shift.opcode->id != PPC_INST_RLWINM ||
++                            shift.operands[2] != 2 || shift.operands[3] != 0 || shift.operands[4] != 29)
++                            return false;
++                        uint32_t r = shift.operands[1];
++                        // r must still hold the index at the bctr.
++                        for (size_t k = sdef + 1; k < i; k++)
++                        {
++                            ppc_insn x;
++                            if (scanner.Decode(k, x) && GenericScanner::Writes(x, r))
++                                return false;
++                        }
++                        uint32_t firstLabel = UINT32_MAX;
++                        std::vector<size_t> labels;
++                        for (uint32_t addr = b.c; addr < firstLabel && labels.size() < 4096; addr += 4)
++                        {
++                            uint32_t entry = ByteSwap(*(const uint32_t*)image.Find(addr));
++                            bool inFunction = fn ? (entry >= fn->first && entry < fn->second)
++                                                 : (entry > b.c && entry < bctrAddr + 0x4000);
++                            if (!inFunction || (entry & 3) || entry <= addr)
++                                break;
++                            labels.push_back(entry);
++                            firstLabel = std::min(firstLabel, entry);
++                        }
++                        if (labels.size() < 2 || b.c + labels.size() * 4 != firstLabel)
++                            return false;
++                        table.r = r;
++                        table.labels = std::move(labels);
++                        table.base = bctrAddr;
++                        table.type = SWITCH_ABSOLUTE;
++                        table.tableAddress = b.c;
++                        table.elemSize = 4;
++                        return true;
++                    }
++                    return false;
++                };
++
++            SymValue target = scanner.Eval(mtctrPos, ctrReg);
++            bool absolute = target.kind == SymValue::Load && target.elemSize == 4 && !target.hasBase && target.shift == 0;
++            bool relative = target.kind == SymValue::Load && target.hasBase;
++            if (!absolute && !relative)
++                return tryInlineTable() ? Result::Found : Result::NotTable;
++
++            if (!scanner.FindBound(i, target.reg, table) || table.labels.empty() || table.labels.size() > 4096)
++            {
++                table = SwitchTable{};
++                return tryInlineTable() ? Result::Found : Result::NoBound;
++            }
++
++            const auto* tableData = (const uint8_t*)image.Find(target.c);
++            if (tableData == nullptr)
++                return Result::BadLabels;
++
++            for (size_t j = 0; j < table.labels.size(); j++)
++            {
++                uint32_t entry;
++                if (target.elemSize == 4)
++                    entry = ByteSwap(((const uint32_t*)tableData)[j]);
++                else if (target.elemSize == 2)
++                    entry = ByteSwap(((const uint16_t*)tableData)[j]);
++                else
++                    entry = tableData[j];
++                table.labels[j] = absolute ? entry : target.base + (entry << target.shift);
++            }
++
++            // Labels must be aligned code inside the same function as the jump.
++            for (size_t label : table.labels)
++            {
++                bool inSection = label >= section.base && label < section.base + section.size && (label & 3) == 0;
++                bool inFunction = fn == nullptr || (label >= fn->first && label < fn->second);
++                if (!inSection || !inFunction)
++                {
++                    fmt::println(stderr, "warning: jump table at {:X} has labels outside its function, skipped", bctrAddr);
++                    return Result::BadLabels;
++                }
++            }
++
++            // Key the table on the bctr itself; the recompiler arms the table at
++            // `base` and consumes it at the next bctr.
++            table.base = bctrAddr;
++            table.type = absolute ? SWITCH_ABSOLUTE : (target.elemSize == 1 ? SWITCH_BYTEOFFSET : SWITCH_SHORTOFFSET);
++            table.tableAddress = target.c;
++            table.elemSize = target.elemSize;
++            return Result::Found;
++        };
++
++    for (const auto& section : image.sections)
++    {
++        if (!(section.flags & SectionFlags_Code))
++            continue;
++
++        GenericScanner scanner{ (const uint32_t*)section.data, section.base, section.size / 4 };
++        scanner.caseSources = &caseSources;
++
++        auto accept = [&](SwitchTable& table)
++            {
++                for (size_t label : table.labels)
++                    caseSources.emplace(uint32_t(label), uint32_t(table.base));
++                switches.emplace_back(std::move(table));
++                stats.found++;
++            };
++
++        std::vector<size_t> pending;
++        for (size_t i = 0; i < scanner.count; i++)
++        {
++            if (ByteSwap(scanner.code[i]) != 0x4E800420) // bctr
++                continue;
++            stats.bctr++;
++
++            SwitchTable table{};
++            switch (tryTable(section, scanner, i, table))
++            {
++            case Result::NotTable: stats.notTable++; break;
++            case Result::BadLabels: stats.badLabels++; break;
++            case Result::NoBound: pending.push_back(i); break;
++            case Result::Found: accept(table); break;
++            }
++        }
++
++        // Each pass may resolve outer switches that let nested ones find their bounds check.
++        bool progress = true;
++        while (progress && !pending.empty())
++        {
++            progress = false;
++            std::vector<size_t> stillPending;
++            for (size_t i : pending)
++            {
++                SwitchTable table{};
++                Result result = tryTable(section, scanner, i, table);
++                if (result == Result::Found)
++                {
++                    accept(table);
++                    progress = true;
++                }
++                else if (result == Result::BadLabels)
++                    stats.badLabels++;
++                else
++                    stillPending.push_back(i);
++            }
++            pending = std::move(stillPending);
++        }
++
++        for (size_t i : pending)
++        {
++            stats.noBound++;
++            fmt::println(stderr, "warning: jump table at {:X} has no usable bounds check", section.base + i * 4);
++        }
++    }
++}
++
+ static std::string out;
+ 
+ template<class... Args>
+@@ -196,6 +786,8 @@ int main(int argc, char** argv)
+         {
+             println("[[switch]]");
+             println("base = 0x{:X}", table.base);
++            if (table.tableAddress != 0)
++                println("# table = 0x{:X}, entry size {}", table.tableAddress, table.elemSize);
+             println("r = {}", table.r);
+             println("default = 0x{:X}", table.defaultLabel);
+             println("labels = [");
+@@ -212,6 +804,20 @@ int main(int argc, char** argv)
+ 
+     println("# Generated by XenonAnalyse");
+ 
++    // Generic detection first; the fixed patterns below only add tables whose
++    // bctr it didn't already cover.
++    GenericScanStats genericStats{};
++    ScanGenericTables(image, switches, genericStats);
++    std::set<size_t> coveredBctr;
++    println("# ---- GENERIC JUMPTABLE ----");
++    for (const auto& table : switches)
++    {
++        coveredBctr.insert(table.base);
++        printTable(table);
++    }
++    fmt::println(stderr, "generic scan: {} bctr, {} tables found, {} not table jumps, {} without bounds check, {} rejected for bad labels",
++        genericStats.bctr, genericStats.found, genericStats.notTable, genericStats.noBound, genericStats.badLabels);
++
+     auto scanPattern = [&](uint32_t* pattern, size_t count, size_t type)
+         {
+             for (const auto& section : image.sections)
+@@ -236,7 +842,18 @@ int main(int argc, char** argv)
+                         ScanTable((uint32_t*)data, base + (data - dataStart), table);
+ 
+                         // fmt::println("{:X} ; jmptable - {}", base + (data - dataStart), table.labels.size());
+-                        if (table.base != 0)
++                        // Find the bctr this pattern feeds so we don't emit a duplicate.
++                        size_t bctrAddr = 0;
++                        for (size_t k = 0; k < 16 && data + k * 4 < dataEnd; k++)
++                        {
++                            if (ByteSwap(((uint32_t*)data)[k]) == 0x4E800420)
++                            {
++                                bctrAddr = base + (data - dataStart) + k * 4;
++                                break;
++                            }
++                        }
++
++                        if (table.base != 0 && !coveredBctr.count(bctrAddr))
+                         {
+                             ReadTable(image, table);
+                             printTable(table);
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..351522f 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -265,11 +265,20 @@ bool Recompiler::Recompile(
+ {
+     println("\t// {} {}", insn.opcode->name, insn.op_str);
+ 
++    // Functions in config.ctxFunctions (and the register save/restore helpers) keep
++    // every register in ctx: see RecompilerConfig::ctxFunctions.
++    const bool localNonArgument = config.nonArgumentRegistersAsLocalVariables && !ctxMode;
++    const bool localNonVolatile = config.nonVolatileRegistersAsLocalVariables && !ctxMode;
++    const bool localCr = config.crRegistersAsLocalVariables && !ctxMode;
++    const bool localCtr = config.ctrAsLocalVariable && !ctxMode;
++    const bool localXer = config.xerAsLocalVariable && !ctxMode;
++    const bool localReserved = config.reservedRegisterAsLocalVariable && !ctxMode;
++
+     // TODO: we could cache these formats in an array
+     auto r = [&](size_t index)
+         {
+-            if ((config.nonArgumentRegistersAsLocalVariables && (index == 0 || index == 2 || index == 11 || index == 12)) || 
+-                (config.nonVolatileRegistersAsLocalVariables && index >= 14))
++            if ((localNonArgument && (index == 0 || index == 2 || index == 11 || index == 12)) ||
++                (localNonVolatile && index >= 14))
+             {
+                 localVariables.r[index] = true;
+                 return fmt::format("r{}", index);
+@@ -279,8 +288,8 @@ bool Recompiler::Recompile(
+ 
+     auto f = [&](size_t index)
+         {
+-            if ((config.nonArgumentRegistersAsLocalVariables && index == 0) ||
+-                (config.nonVolatileRegistersAsLocalVariables && index >= 14))
++            if ((localNonArgument && index == 0) ||
++                (localNonVolatile && index >= 14))
+             {
+                 localVariables.f[index] = true;
+                 return fmt::format("f{}", index);
+@@ -290,8 +299,8 @@ bool Recompiler::Recompile(
+ 
+     auto v = [&](size_t index)
+         {
+-            if ((config.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+-                (config.nonVolatileRegistersAsLocalVariables && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))))
++            if ((localNonArgument && (index >= 32 && index <= 63)) ||
++                (localNonVolatile && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))))
+             {
+                 localVariables.v[index] = true;
+                 return fmt::format("v{}", index);
+@@ -301,7 +310,7 @@ bool Recompiler::Recompile(
+ 
+     auto cr = [&](size_t index)
+         {
+-            if (config.crRegistersAsLocalVariables)
++            if (localCr)
+             {
+                 localVariables.cr[index] = true;
+                 return fmt::format("cr{}", index);
+@@ -311,7 +320,7 @@ bool Recompiler::Recompile(
+ 
+     auto ctr = [&]()
+         {
+-            if (config.ctrAsLocalVariable)
++            if (localCtr)
+             {
+                 localVariables.ctr = true;
+                 return "ctr";
+@@ -321,7 +330,7 @@ bool Recompiler::Recompile(
+ 
+     auto xer = [&]()
+         {
+-            if (config.xerAsLocalVariable)
++            if (localXer)
+             {
+                 localVariables.xer = true;
+                 return "xer";
+@@ -331,7 +340,7 @@ bool Recompiler::Recompile(
+ 
+     auto reserved = [&]()
+         {
+-            if (config.reservedRegisterAsLocalVariable)
++            if (localReserved)
+             {
+                 localVariables.reserved = true;
+                 return "reserved";
+@@ -388,9 +397,16 @@ bool Recompiler::Recompile(
+ 
+                 if (targetSymbol != image.symbols.end() && targetSymbol->address == address && targetSymbol->type == Symbol_Function)
+                 {
+-                    if (config.nonVolatileRegistersAsLocalVariables && (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0))
++                    if (localNonVolatile && (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0))
+                     {
+-                        // print nothing
++                        // The helper call is left out: the registers it saves are locals.
++                        // __savegprlr_N also stores the return address (r12, from mflr) at
++                        // -8(r1) and __restgprlr_N loads it back into lr; keep that, so guest
++                        // stack walks (profiler, thread dumps) still find return addresses.
++                        if (!config.skipLr && targetSymbol->name.find("__savegprlr_") == 0)
++                            println("\tPPC_STORE_U32(ctx.r1.u32 + -8, {}.u32);", r(12));
++                        else if (!config.skipLr && targetSymbol->name.find("__restgprlr_") == 0)
++                            println("\tctx.lr = PPC_LOAD_U32(ctx.r1.u32 + -8);");
+                     }
+                     else
+                     {
+@@ -609,7 +625,9 @@ bool Recompiler::Recompile(
+     case PPC_INST_BCTR:
+         if (switchTable != config.switchTables.end())
+         {
+-            println("\tswitch ({}.u64) {{", r(switchTable->second.r));
++            // The index is a 32-bit value (bounds-checked with cmplwi, the table load uses the
++            // low word): rlwinm with a wrap-around mask can leave garbage in the upper half.
++            println("\tswitch ({}.u32) {{", r(switchTable->second.r));
+ 
+             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
+             {
+@@ -663,10 +681,19 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_BDNZF:
+-        // NOTE: assuming eq here as a shortcut because all the instructions in the game do that
++    case PPC_INST_BDNZT:
++    case PPC_INST_BDZF:
++    {
++        // operands[0] is the BI field: CR field BI/4, bit BI%4 (lt, gt, eq, so)
++        static constexpr const char* CRBits[] = { "lt", "gt", "eq", "so" };
++        uint32_t id = insn.opcode->id;
++        bool ctrZero = id == PPC_INST_BDZF;
++        bool bitSet = id == PPC_INST_BDNZT;
+         println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 != 0 && !{}.eq) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), insn.operands[1]);
++        println("\tif ({}.u32 {} 0 && {}{}.{}) goto loc_{:X};", ctr(), ctrZero ? "==" : "!=",
++            bitSet ? "" : "!", cr(insn.operands[0] / 4), CRBits[insn.operands[0] % 4], insn.operands[1]);
+         break;
++    }
+ 
+     case PPC_INST_BEQ:
+         printConditionalBranch(false, "eq");
+@@ -1133,6 +1160,7 @@ bool Recompiler::Recompile(
+         println("\t{}.s64 = {};", r(insn.operands[0]), int32_t(insn.operands[1] << 16));
+         break;
+ 
++    case PPC_INST_LVEHX:
+     case PPC_INST_LVEWX:
+     case PPC_INST_LVEWX128:
+     case PPC_INST_LVX:
+@@ -1225,6 +1253,117 @@ bool Recompiler::Recompile(
+         println("\t{}.u32 = {};", r(insn.operands[2]), ea());
+         break;
+ 
++    // Load/store with update. D-form: op rD, d(rA); X-form: op rD, rA, rB.
++    // The effective address is computed first, then rA is updated with it.
++    case PPC_INST_LHZU:
++    case PPC_INST_LHAU:
++    case PPC_INST_LHZUX:
++    case PPC_INST_LBZUX:
++    case PPC_INST_LWZUX:
++    case PPC_INST_LDUX:
++    {
++        uint32_t id = insn.opcode->id;
++        bool xform = id == PPC_INST_LHZUX || id == PPC_INST_LBZUX || id == PPC_INST_LWZUX || id == PPC_INST_LDUX;
++        uint32_t ra = xform ? insn.operands[1] : insn.operands[2];
++        if (xform)
++            println("\t{} = {}.u32 + {}.u32;", ea(), r(ra), r(insn.operands[2]));
++        else
++            println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(ra));
++
++        if (id == PPC_INST_LHAU)
++            println("\t{}.s64 = int16_t(PPC_LOAD_U16({}));", r(insn.operands[0]), ea());
++        else if (id == PPC_INST_LBZUX)
++            println("\t{}.u64 = PPC_LOAD_U8({});", r(insn.operands[0]), ea());
++        else if (id == PPC_INST_LWZUX)
++            println("\t{}.u64 = PPC_LOAD_U32({});", r(insn.operands[0]), ea());
++        else if (id == PPC_INST_LDUX)
++            println("\t{}.u64 = PPC_LOAD_U64({});", r(insn.operands[0]), ea());
++        else
++            println("\t{}.u64 = PPC_LOAD_U16({});", r(insn.operands[0]), ea());
++        println("\t{}.u32 = {};", r(ra), ea());
++        break;
++    }
++
++    case PPC_INST_STHU:
++    case PPC_INST_STHUX:
++    case PPC_INST_STBUX:
++    case PPC_INST_STDUX:
++    {
++        uint32_t id = insn.opcode->id;
++        bool xform = id != PPC_INST_STHU;
++        uint32_t ra = xform ? insn.operands[1] : insn.operands[2];
++        if (xform)
++            println("\t{} = {}.u32 + {}.u32;", ea(), r(ra), r(insn.operands[2]));
++        else
++            println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(ra));
++
++        const char* store = id == PPC_INST_STBUX ? "PPC_STORE_U8" : id == PPC_INST_STDUX ? "PPC_STORE_U64" : "PPC_STORE_U16";
++        const char* field = id == PPC_INST_STBUX ? "u8" : id == PPC_INST_STDUX ? "u64" : "u16";
++        println("\t{}({}, {}.{});", store, ea(), r(insn.operands[0]), field);
++        println("\t{}.u32 = {};", r(ra), ea());
++        break;
++    }
++
++    case PPC_INST_LFSU:
++    case PPC_INST_LFSUX:
++    case PPC_INST_LFDU:
++    case PPC_INST_LFDUX:
++    {
++        uint32_t id = insn.opcode->id;
++        bool xform = id == PPC_INST_LFSUX || id == PPC_INST_LFDUX;
++        uint32_t ra = xform ? insn.operands[1] : insn.operands[2];
++        printSetFlushMode(false);
++        if (xform)
++            println("\t{} = {}.u32 + {}.u32;", ea(), r(ra), r(insn.operands[2]));
++        else
++            println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(ra));
++
++        if (id == PPC_INST_LFSU || id == PPC_INST_LFSUX)
++        {
++            println("\t{}.u32 = PPC_LOAD_U32({});", temp(), ea());
++            println("\t{}.f64 = double({}.f32);", f(insn.operands[0]), temp());
++        }
++        else
++        {
++            println("\t{}.u64 = PPC_LOAD_U64({});", f(insn.operands[0]), ea());
++        }
++        println("\t{}.u32 = {};", r(ra), ea());
++        break;
++    }
++
++    case PPC_INST_STFSU:
++    case PPC_INST_STFSUX:
++    case PPC_INST_STFDU:
++    {
++        uint32_t id = insn.opcode->id;
++        bool xform = id == PPC_INST_STFSUX;
++        uint32_t ra = xform ? insn.operands[1] : insn.operands[2];
++        printSetFlushMode(false);
++        if (xform)
++            println("\t{} = {}.u32 + {}.u32;", ea(), r(ra), r(insn.operands[2]));
++        else
++            println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(ra));
++
++        if (id == PPC_INST_STFDU)
++        {
++            println("\tPPC_STORE_U64({}, {}.u64);", ea(), f(insn.operands[0]));
++        }
++        else
++        {
++            println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++            println("\tPPC_STORE_U32({}, {}.u32);", ea(), temp());
++        }
++        println("\t{}.u32 = {};", r(ra), ea());
++        break;
++    }
++
++    case PPC_INST_LHBRX:
++        print("\t{}.u64 = __builtin_bswap16(PPC_LOAD_U16(", r(insn.operands[0]));
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32));", r(insn.operands[2]));
++        break;
++
+     case PPC_INST_LWZX:
+         print("\t{}.u64 = PPC_LOAD_U32(", r(insn.operands[0]));
+         if (insn.operands[1] != 0)
+@@ -1260,7 +1399,8 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_MFTB:
+-        println("\t{}.u64 = __rdtsc();", r(insn.operands[0]));
++        // The Xenon time base runs at 50 MHz; hosts can supply a matching counter.
++        println("\t{}.u64 = PPC_QUERY_TIMEBASE();", r(insn.operands[0]));
+         break;
+ 
+     case PPC_INST_MR:
+@@ -1329,6 +1469,64 @@ bool Recompiler::Recompile(
+         println("\t{}.u64 = ~({}.u64 & {}.u64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         break;
+ 
++    case PPC_INST_EQV:
++        // eqv rA, rS, rB
++        println("\t{}.u64 = ~({}.u64 ^ {}.u64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_ADDC:
++        // Carry is the 32-bit unsigned carry out of rA + rB.
++        println("\t{}.ca = {}.u32 + {}.u32 < {}.u32;", xer(), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]));
++        println("\t{}.u64 = {}.u64 + {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_ADDME:
++        // rD = rA + CA - 1. Carry out of rA + CA + 0xFFFFFFFF is set unless rA == 0 and CA == 0.
++        println("\t{}.u8 = ({}.u32 != 0) | {}.ca;", temp(), r(insn.operands[1]), xer());
++        println("\t{}.u64 = {}.u64 + {}.ca - 1;", r(insn.operands[0]), r(insn.operands[1]), xer());
++        println("\t{}.ca = {}.u8;", xer(), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_SUBFZE:
++        // rD = ~rA + CA. Carry out is set only when ~rA == 0xFFFFFFFF (rA == 0) and CA == 1.
++        println("\t{}.u8 = ({}.u32 == 0) & {}.ca;", temp(), r(insn.operands[1]), xer());
++        println("\t{}.u64 = ~{}.u64 + {}.ca;", r(insn.operands[0]), r(insn.operands[1]), xer());
++        println("\t{}.ca = {}.u8;", xer(), temp());
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_MULHD:
++        println("\t{}.s64 = int64_t((__int128({}.s64) * __int128({}.s64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_FCTIW:
++        // Converts using the current rounding mode (round-to-nearest-even by default),
++        // saturating to INT_MAX on positive overflow; NaN and negative overflow give INT_MIN.
++        printSetFlushMode(false);
++        println("\t{}.s64 = ({}.f64 > double(INT_MAX)) ? INT_MAX : simde_mm_cvtsd_si32(simde_mm_load_sd(&{}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[1]));
++        break;
++
++    case PPC_INST_FRSQRTE:
++        // Estimate instruction; computing the exact value is within its precision.
++        printSetFlushMode(false);
++        println("\t{}.f64 = 1.0 / sqrt({}.f64);", f(insn.operands[0]), f(insn.operands[1]));
++        break;
++
++    case PPC_INST_FNMADD:
++        // fnmadd frD, frA, frC, frB: -(frA * frC + frB)
++        printSetFlushMode(false);
++        println("\t{}.f64 = -({}.f64 * {}.f64 + {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        break;
++
+     case PPC_INST_NEG:
+         println("\t{}.s64 = -{}.s64;", r(insn.operands[0]), r(insn.operands[1]));
+         if (strchr(insn.opcode->name, '.'))
+@@ -1386,6 +1584,8 @@ bool Recompiler::Recompile(
+     {
+         const uint64_t mask = ComputeMask(insn.operands[3] + 32, insn.operands[4] + 32);
+         println("\t{}.u64 = (__builtin_rotateleft32({}.u32, {}) & 0x{:X}) | ({}.u64 & 0x{:X});", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2], mask, r(insn.operands[0]), ~mask);
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+     }
+ 
+@@ -1877,8 +2077,70 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VCMPGTUH:
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        // Byte mask so partially-true halfword lanes are counted correctly.
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
+         break;
+ 
++    case PPC_INST_VCMPGTSW:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epi32(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VCMPGTUW:
++        // Unsigned compare via signed compare with the sign bits flipped.
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epi32("
++            "simde_mm_xor_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_set1_epi32(INT_MIN)), "
++            "simde_mm_xor_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_set1_epi32(INT_MIN))));",
++            v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VSEL128:
++        // vsel128 vD, vA, vB, vC(=vD): bits from vB where the mask is set, otherwise vA
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VPKSWSS:
++    case PPC_INST_VPKSWSS128:
++        // Signed saturating pack of words to halfwords. vA's elements come first in
++        // PPC order, so with the reversed vector layout vB goes in the low half.
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_packs_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VCTUXS:
++    case PPC_INST_VCFPUXWS128:
++        // Float to unsigned word with scale 2^uimm, truncating and saturating; NaN gives 0.
++        printSetFlushMode(true);
++        println("\tfor (int i = 0; i < 4; i++) {{");
++        println("\t\tfloat x = {}.f32[i] * {}.0f;", v(insn.operands[1]), 1u << insn.operands[2]);
++        println("\t\t{}.u32[i] = (x != x || x <= 0.0f) ? 0u : (x >= 4294967296.0f) ? 0xFFFFFFFFu : uint32_t(x);", vTemp());
++        println("\t}}");
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_load_si128((simde__m128i*){}.u8));", v(insn.operands[0]), vTemp());
++        break;
++
++    case PPC_INST_VSUBUHS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_subs_epu16(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSUBUWM:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_sub_epi32(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSLH:
++    case PPC_INST_VSRH:
++    {
++        // Per-halfword shift by the low 4 bits of the matching halfword of vB.
++        // Read vB first so vD aliasing vA/vB is handled.
++        const char* op = insn.opcode->id == PPC_INST_VSLH ? "<<" : ">>";
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_load_si128((simde__m128i*){}.u8));", vTemp(), v(insn.operands[2]));
++        for (size_t i = 0; i < 8; i++)
++            println("\t{}.u16[{}] = uint16_t({}.u16[{}] {} ({}.u16[{}] & 0xF));", v(insn.operands[0]), i, v(insn.operands[1]), i, op, vTemp(), i);
++        break;
++    }
++
+     case PPC_INST_VEXPTEFP:
+     case PPC_INST_VEXPTEFP128:
+         // TODO: vectorize
+@@ -2212,6 +2474,21 @@ bool Recompiler::Recompile(
+             println("\t{} = {};", v(insn.operands[0]), vTemp());
+             break;
+ 
++        case 3: // 2 half floats (VPACK_FLOAT16_2): the last two halfwords to x, y; z = 0, w = 1
++            println("\t{}.f32[3] = ppc_half_to_float({}.u16[1]);", vTemp(), v(insn.operands[1]));
++            println("\t{}.f32[2] = ppc_half_to_float({}.u16[0]);", vTemp(), v(insn.operands[1]));
++            println("\t{}.f32[1] = 0.0f;", vTemp());
++            println("\t{}.f32[0] = 1.0f;", vTemp());
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
++        case 5: // 4 half floats (VPACK_FLOAT16_4): the last four halfwords to x, y, z, w
++            // With the reversed vector layout, float i comes from halfword i.
++            for (size_t i = 0; i < 4; i++)
++                println("\t{}.f32[{}] = ppc_half_to_float({}.u16[{}]);", vTemp(), i, v(insn.operands[1]), i);
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
+         default:
+             println("\t__builtin_debugtrap();");
+             break;
+@@ -2381,6 +2658,10 @@ bool Recompiler::Recompile(const Function& fn)
+         name = fmt::format("sub_{}", fn.base);
+     }
+ 
++    // The register save/restore helpers operate on the context: they are only
++    // called from ctx-mode functions once the *_as_local options are on.
++    ctxMode = config.ctxFunctions.count(fn.base) != 0 ||name.find("__save") == 0 || name.find("__rest") == 0;
++
+ #ifdef XENON_RECOMP_USE_ALIAS
+     println("__attribute__((alias(\"__imp__{}\"))) PPC_WEAK_FUNC({});", name, name);
+ #endif
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 8242db5..8416563 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -34,6 +34,7 @@ struct Recompiler
+     std::string out;
+     size_t cppFileIndex = 0;
+     RecompilerConfig config;
++    bool ctxMode = false; // the function being recompiled keeps all registers in ctx (config.ctxFunctions)
+ 
+     bool LoadConfig(const std::string_view& configFilePath);
+ 
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index 81330a4..ea28d15 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -58,6 +58,12 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+             }
+         }
+ 
++        if (auto ctxArray = main["ctx_functions"].as_array())
++        {
++            for (auto& addr : *ctxArray)
++                ctxFunctions.emplace(*addr.value<uint32_t>());
++        }
++
+         if (auto invalidArray = main["invalid_instructions"].as_array())
+         {
+             for (auto& instr : *invalidArray)
+diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
+index 534e503..a1a4767 100644
+--- a/XenonRecomp/recompiler_config.h
++++ b/XenonRecomp/recompiler_config.h
+@@ -50,6 +50,12 @@ struct RecompilerConfig
+     uint32_t longJmpAddress = 0;
+     uint32_t setJmpAddress = 0;
+     std::unordered_map<uint32_t, uint32_t> functions;
++    // Functions that keep every register in the context even when the *_as_local
++    // options are on: they share registers with other functions beyond the calling
++    // convention (SEH funclets reading the parent's frame and registers, function
++    // tails split off by the analysis, setjmp callers). Calls between two of them
++    // pass registers through ctx as before.
++    std::unordered_set<uint32_t> ctxFunctions;
+     std::unordered_map<uint32_t, uint32_t> invalidInstructions;
+     std::unordered_map<uint32_t, RecompilerMidAsmHook> midAsmHooks;
+ 
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..1d236df 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -11,6 +11,7 @@
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <type_traits>
+ 
+ #include <x86/avx.h>
+ #include <x86/sse.h>
+@@ -24,7 +25,46 @@
+ #define PPC_JOIN(x, y) x##y
+ #define PPC_XSTRINGIFY(x) #x
+ #define PPC_STRINGIFY(x) PPC_XSTRINGIFY(x)
+-#define PPC_FUNC(x) void x(PPCContext& __restrict ctx, uint8_t* base)
++// Time base read by mftb. The Xenon's counts at 50 MHz; define
++// PPC_TIMEBASE_EXTERNAL and provide PPCTimeBase() to match it, otherwise the
++// host TSC is used (which runs far faster).
++#ifdef PPC_TIMEBASE_EXTERNAL
++uint64_t PPCTimeBase();
++#define PPC_QUERY_TIMEBASE() PPCTimeBase()
++#elif !defined(PPC_QUERY_TIMEBASE)
++#define PPC_QUERY_TIMEBASE() __rdtsc()
++#endif
++
++// Physical memory is visible at 0xA0000000 (64 KB pages), 0xC0000000 (16 MB
++// pages) and 0xE0000000 (4 KB pages, offset by 0x1000). With
++// PPC_FOLD_PHYSICAL_VIEWS, `base` folds the latter two onto the first, so hosts
++// that can't alias memory (like WebAssembly) only back 0x00000000-0xBFFFFFFF.
++inline uint32_t ppc_fold_view(uint32_t a)
++{
++    if (a < 0xC0000000u)
++        return a;
++    return a < 0xE0000000u ? a - 0x20000000u : a - 0x40000000u + 0x1000u;
++}
++
++#ifdef PPC_FOLD_PHYSICAL_VIEWS
++struct PPCGuestBase
++{
++    uint8_t* p;
++    PPCGuestBase(uint8_t* p) : p(p) {}
++    template<class T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
++    uint8_t* operator+(T offset) const
++    {
++        // Offsets past 4 GB never occur; the function table offset stays below 0xC0000000.
++        return p + ppc_fold_view(uint32_t(offset));
++    }
++    explicit operator uintptr_t() const { return (uintptr_t)p; }
++};
++#define PPC_BASE_TYPE PPCGuestBase
++#else
++#define PPC_BASE_TYPE uint8_t*
++#endif
++
++#define PPC_FUNC(x) void x(PPCContext& __restrict ctx, PPC_BASE_TYPE base)
+ #define PPC_FUNC_IMPL(x) extern "C" PPC_FUNC(x)
+ #define PPC_EXTERN_FUNC(x) extern PPC_FUNC(x)
+ #define PPC_WEAK_FUNC(x) __attribute__((weak,noinline)) PPC_FUNC(x)
+@@ -113,7 +153,7 @@
+ #define PPC_CALL_INDIRECT_FUNC(x) (PPC_LOOKUP_FUNC(base, x))(ctx, base)
+ #endif
+ 
+-typedef void PPCFunc(struct PPCContext& __restrict__ ctx, uint8_t* base);
++typedef void PPCFunc(struct PPCContext& __restrict__ ctx, PPC_BASE_TYPE base);
+ 
+ struct PPCFuncMapping
+ {
+@@ -172,6 +212,19 @@ struct PPCCRRegister
+         eq = !un && (left == right);
+     }
+ 
++#if defined(__wasm__)
++    // simde__m128 and simde__m128i are the same type on WebAssembly, so one
++    // function serves both: callers pass 0xF for 4-lane float masks and 0xFFFF
++    // for byte masks.
++    inline void setFromMask(simde__m128i mask, int imm) noexcept
++    {
++        int m = imm == 0xF ? simde_mm_movemask_ps(simde_mm_castsi128_ps(mask)) : simde_mm_movemask_epi8(mask);
++        lt = m == imm; // all equal
++        gt = 0;
++        eq = m == 0; // none equal
++        so = 0;
++    }
++#else
+     inline void setFromMask(simde__m128 mask, int imm) noexcept
+     {
+         int m = simde_mm_movemask_ps(mask);
+@@ -189,6 +242,7 @@ struct PPCCRRegister
+         eq = m == 0; // none equal
+         so = 0;
+     }
++#endif
+ };
+ 
+ union alignas(0x10) PPCVRegister
+@@ -218,7 +272,8 @@ struct PPCFPSCRRegister
+     static constexpr size_t HostToGuest[] = { PPC_ROUND_NEAREST, PPC_ROUND_DOWN, PPC_ROUND_UP, PPC_ROUND_TOWARD_ZERO };
+ 
+     // simde does not handle denormal flags, so we need to implement per-arch.
+-#if defined(__x86_64__) || defined(_M_X64)
++// WebAssembly has no FP control register; SIMDe emulates the x86 one portably.
++#if defined(__x86_64__) || defined(_M_X64) || defined(__wasm__)
+     static constexpr size_t RoundShift = 13;
+     static constexpr size_t RoundMask = SIMDE_MM_ROUND_MASK;
+     static constexpr size_t FlushMask = SIMDE_MM_FLUSH_ZERO_MASK | _MM_DENORMALS_ZERO_MASK;
+@@ -303,14 +358,13 @@ struct PPCFPSCRRegister
+ 
+ struct alignas(0x40) PPCContext
+ {
++    // Register fields stay even when *_as_local options make them function locals:
++    // functions listed in the config's ctx_functions (and the save/restore helpers)
++    // still keep their registers here.
+     PPCRegister r3;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
+     PPCRegister r0;
+-#endif
+     PPCRegister r1;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
+     PPCRegister r2;
+-#endif
+     PPCRegister r4;
+     PPCRegister r5;
+     PPCRegister r6;
+@@ -318,12 +372,9 @@ struct alignas(0x40) PPCContext
+     PPCRegister r8;
+     PPCRegister r9;
+     PPCRegister r10;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
+     PPCRegister r11;
+     PPCRegister r12;
+-#endif
+     PPCRegister r13;
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+     PPCRegister r14;
+     PPCRegister r15;
+     PPCRegister r16;
+@@ -342,24 +393,16 @@ struct alignas(0x40) PPCContext
+     PPCRegister r29;
+     PPCRegister r30;
+     PPCRegister r31;
+-#endif
+ 
+ #ifndef PPC_CONFIG_SKIP_LR
+     uint64_t lr;
+ #endif
+-#ifndef PPC_CONFIG_CTR_AS_LOCAL
+     PPCRegister ctr;
+-#endif
+-#ifndef PPC_CONFIG_XER_AS_LOCAL
+     PPCXERRegister xer;
+-#endif
+-#ifndef PPC_CONFIG_RESERVED_AS_LOCAL
+     PPCRegister reserved;
+-#endif
+ #ifndef PPC_CONFIG_SKIP_MSR
+     uint32_t msr = 0x200A000;
+ #endif
+-#ifndef PPC_CONFIG_CR_AS_LOCAL
+     PPCCRRegister cr0;
+     PPCCRRegister cr1;
+     PPCCRRegister cr2;
+@@ -368,12 +411,9 @@ struct alignas(0x40) PPCContext
+     PPCCRRegister cr5;
+     PPCCRRegister cr6;
+     PPCCRRegister cr7;
+-#endif
+     PPCFPSCRRegister fpscr;
+ 
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
+     PPCRegister f0;
+-#endif
+     PPCRegister f1;
+     PPCRegister f2;
+     PPCRegister f3;
+@@ -387,7 +427,6 @@ struct alignas(0x40) PPCContext
+     PPCRegister f11;
+     PPCRegister f12;
+     PPCRegister f13;
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+     PPCRegister f14;
+     PPCRegister f15;
+     PPCRegister f16;
+@@ -406,7 +445,6 @@ struct alignas(0x40) PPCContext
+     PPCRegister f29;
+     PPCRegister f30;
+     PPCRegister f31;
+-#endif
+ 
+     PPCVRegister v0;
+     PPCVRegister v1;
+@@ -422,7 +460,6 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v11;
+     PPCVRegister v12;
+     PPCVRegister v13;
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+     PPCVRegister v14;
+     PPCVRegister v15;
+     PPCVRegister v16;
+@@ -441,8 +478,6 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v29;
+     PPCVRegister v30;
+     PPCVRegister v31;
+-#endif
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
+     PPCVRegister v32;
+     PPCVRegister v33;
+     PPCVRegister v34;
+@@ -475,8 +510,6 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v61;
+     PPCVRegister v62;
+     PPCVRegister v63;
+-#endif
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+     PPCVRegister v64;
+     PPCVRegister v65;
+     PPCVRegister v66;
+@@ -541,7 +574,6 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v125;
+     PPCVRegister v126;
+     PPCVRegister v127;
+-#endif
+ };
+ 
+ inline uint8_t VectorMaskL[] =
+@@ -672,6 +704,30 @@ inline simde__m128i simde_mm_cmpgt_epu16(simde__m128i a, simde__m128i b)
+     return simde_mm_cmpgt_epi16(simde_mm_xor_si128(a, c), simde_mm_xor_si128(b, c));
+ }
+ 
++// IEEE 754 half precision to single precision (used by vupkd3d128 FLOAT16 formats).
++inline float ppc_half_to_float(uint16_t h)
++{
++    uint32_t sign = uint32_t(h & 0x8000) << 16;
++    uint32_t exponent = (h >> 10) & 0x1F;
++    uint32_t mantissa = h & 0x3FF;
++    uint32_t bits;
++    if (exponent == 0x1F) // infinity / NaN
++        bits = sign | 0x7F800000 | (mantissa << 13);
++    else if (exponent != 0) // normal
++        bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
++    else if (mantissa == 0) // zero
++        bits = sign;
++    else // subnormal: normalize
++    {
++        int shift = 0;
++        while (!(mantissa & 0x400)) { mantissa <<= 1; shift++; }
++        bits = sign | ((113 - shift) << 23) | ((mantissa & 0x3FF) << 13);
++    }
++    float f;
++    memcpy(&f, &bits, 4);
++    return f;
++}
++
+ inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
+ {
+     simde__m128 xmm2 = simde_mm_cmpunord_ps(src1, src1);
+@@ -696,7 +752,7 @@ inline uint64_t __rdtsc()
+                  : "=r"(ret)::"memory");
+     return ret;
+ }
+-#elif !defined(__x86_64__) && !defined(_M_X64)
++#elif !defined(__x86_64__) && !defined(_M_X64) && !defined(PPC_TIMEBASE_EXTERNAL)
+ #   error "Missing implementation for __rdtsc()"
+ #endif
+ 

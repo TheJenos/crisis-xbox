@@ -1,0 +1,62 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WGSL shader check</title>
+<style>body { font: 13px monospace; background: #111; color: #ddd; } .bad { color: #f77; } .ok { color: #7f7; }</style>
+<pre id="log">checking...</pre>
+<script type="module">
+// Compiles every translated shader in shader-check/wgsl/ with this browser's
+// WebGPU compiler and builds a render pipeline for it (paired with a
+// pass-through shader of the other stage), reporting every error.
+const log = document.getElementById('log');
+const lines = [];
+const out = (s, cls) => { lines.push(cls ? `<span class="${cls}">${s}</span>` : s); };
+const adapter = await navigator.gpu?.requestAdapter();
+if (!adapter) { log.textContent = 'WebGPU unavailable'; throw new Error('no adapter'); }
+const device = await adapter.requestDevice();
+const dir = new URLSearchParams(location.search).get('dir') || 'wgsl';
+const names = await (await fetch(`${dir}/index.json`)).json();
+
+const passVs = device.createShaderModule({ code: `
+struct O { @builtin(position) p: vec4f, ${[...Array(16).keys()].map(i => `@location(${i}) i${i}: vec4f,`).join(' ')} }
+@vertex fn main() -> O { var o: O; return o; }` });
+const passPs = device.createShaderModule({ code: `@fragment fn main() -> @location(0) vec4f { return vec4f(1.0); }` });
+
+let ok = 0, bad = 0;
+const results = {};
+for (const name of names) {
+  const code = await (await fetch(`${dir}/${name}.wgsl`)).text();
+  const pixel = name.startsWith('ps_');
+  device.pushErrorScope('validation');
+  const module = device.createShaderModule({ code });
+  const info = await module.getCompilationInfo();
+  const errors = info.messages.filter(m => m.type === 'error');
+  let pipelineError = null;
+  if (!errors.length) {
+    const targets = [0, 1, 2, 3].filter(i => code.includes(`@location(${i}) c${i}:`)).map(() => ({ format: 'rgba8unorm' }));
+    const sparse = [];
+    for (let i = 0; i < 4; i++) sparse.push(code.includes(`@location(${i}) c${i}:`) ? { format: 'rgba8unorm' } : null);
+    while (sparse.length && sparse[sparse.length - 1] === null) sparse.pop();
+    try {
+      device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: pixel ? passVs : module, entryPoint: 'main' },
+        fragment: { module: pixel ? module : passPs, entryPoint: 'main', targets: pixel ? sparse : [{ format: 'rgba8unorm' }] },
+        depthStencil: (code.includes('frag_depth') || (pixel && !sparse.length)) ? { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'always' } : undefined,
+      });
+    } catch (e) { pipelineError = String(e); }
+  }
+  const scope = await device.popErrorScope();
+  if (scope && !pipelineError) pipelineError = scope.message;
+  if (errors.length || pipelineError) {
+    bad++;
+    results[name] = errors.map(m => `${m.lineNum}:${m.linePos} ${m.message}`).concat(pipelineError ? [pipelineError] : []);
+    out(`FAIL ${name}`, 'bad');
+    for (const e of results[name].slice(0, 4)) out('    ' + e.replace(/</g, '&lt;'));
+  } else {
+    ok++;
+  }
+}
+out(`${ok} ok, ${bad} failed of ${names.length}`, bad ? 'bad' : 'ok');
+log.innerHTML = lines.join('\n');
+window.shaderCheck = { ok, bad, results };
+</script>

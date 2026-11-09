@@ -1,0 +1,167 @@
+# XenonRecomp configuration for Crysis 2 (Xbox 360, title 454108E3, version 0.0.0.2)
+# Paths are relative to this file.
+
+[main]
+file_path = "../../extracted/default.xex"
+out_directory_path = "../ppc-loc2"
+switch_table_file_path = "Crysis2_switch_tables.toml"
+
+# Optimizations stay off until a recompilation runs correctly.
+skip_lr = false
+skip_msr = false
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+non_argument_as_local = true
+non_volatile_as_local = true
+
+# Register save/restore helpers, found by the byte signatures in XenonRecomp's README
+# (each matched exactly once in .text).
+restgprlr_14_address = 0x8347A120
+savegprlr_14_address = 0x8347A0D0
+restfpr_14_address = 0x8347A7BC
+savefpr_14_address = 0x8347A770
+restvmx_14_address = 0x83487458
+savevmx_14_address = 0x834871C0
+restvmx_64_address = 0x834874EC
+savevmx_64_address = 0x83487254
+
+# longjmp: restores FPRs/VMX from the buffer, then LR (+308), r1 (+144) and CR (+304),
+# returning the value argument (or 1); its other path calls RtlUnwind.
+# setjmp: leaf function directly before it, saving those same buffer slots and returning 0.
+longjmp_address = 0x83484630
+setjmp_address = 0x83484360
+
+invalid_instructions = [
+    { data = 0x00000000, size = 4 }, # Padding between functions
+]
+
+# Leaf functions (no .pdata entry) containing jump tables. XenonRecomp's own boundary
+# analysis stops at the first bctr in these, so their bounds are given explicitly:
+# the gap between .pdata entries, split at bl targets, minus zero padding.
+functions = [
+    { address = 0x822A6808, size = 0xF4 },
+    { address = 0x822CBD18, size = 0x114 },
+    { address = 0x822D23F0, size = 0x114 },
+    { address = 0x822ED448, size = 0x9C },
+    { address = 0x8231B6B0, size = 0x114 },
+    { address = 0x82348760, size = 0x74 },
+    { address = 0x824D0260, size = 0x9C },
+    { address = 0x826FD6B8, size = 0xCC },
+    { address = 0x82832DE0, size = 0x1C8 },
+    { address = 0x82847290, size = 0x140 },
+    { address = 0x82856100, size = 0x27C },
+    { address = 0x8286D3D8, size = 0x150 },
+    { address = 0x8286D528, size = 0x154 },
+    { address = 0x82874C78, size = 0x248 },
+    { address = 0x828765C8, size = 0x810 },
+    { address = 0x828EC180, size = 0x104 },
+    { address = 0x828EC348, size = 0x274 },
+    { address = 0x828ED178, size = 0x1EC },
+    { address = 0x828FAAE8, size = 0x198 },
+    { address = 0x82957790, size = 0x120 },
+    { address = 0x82A9A650, size = 0x108 },
+    { address = 0x82BDAB78, size = 0xB8 },
+    { address = 0x82C58820, size = 0x4D4 },
+    { address = 0x82C59670, size = 0xB0 },
+    { address = 0x82C69AA0, size = 0x4D4 },
+    { address = 0x82C6AFE0, size = 0x9DC },
+    { address = 0x82C72A80, size = 0x50C },
+    { address = 0x82C74690, size = 0x4D4 },
+    { address = 0x82C86220, size = 0x4D4 },
+    { address = 0x82C88250, size = 0x4D4 },
+    { address = 0x82C8A210, size = 0x4D4 },
+    { address = 0x82C8B088, size = 0x4D4 },
+    { address = 0x82CB1F60, size = 0x4D4 },
+    { address = 0x82CB2928, size = 0x4D4 },
+    { address = 0x82CB3190, size = 0x4D4 },
+    { address = 0x82CB39E0, size = 0x4D4 },
+    { address = 0x830A3EA8, size = 0xA4 },
+    { address = 0x830F09A0, size = 0x80 },
+    { address = 0x831779E0, size = 0x8C },
+    { address = 0x831A7598, size = 0x454 },
+    { address = 0x831BBF20, size = 0x88 },
+    { address = 0x831CAE50, size = 0x13C },
+    { address = 0x8324C748, size = 0xC4 },
+    { address = 0x8334E3E8, size = 0x114 },
+    { address = 0x833ABB38, size = 0x46C },
+    { address = 0x834FC768, size = 0x188 },
+    { address = 0x835AA048, size = 0x448 },
+    { address = 0x8366CA30, size = 0x2E8 },
+    { address = 0x83736AB8, size = 0x114 },
+    { address = 0x83785708, size = 0x110 },
+    { address = 0x837E7E70, size = 0xC8 },
+    { address = 0x838E5410, size = 0x68 },
+    { address = 0x838E5478, size = 0x64 },
+    { address = 0x838E54E0, size = 0x5C },
+    { address = 0x838E5540, size = 0x198 },
+    { address = 0x838E56D8, size = 0x16C },
+    { address = 0x838FBBC0, size = 0xFC },
+    { address = 0x83914190, size = 0xDC },
+    { address = 0x8392E608, size = 0x784 },
+    { address = 0x8395AE88, size = 0x1D4 },
+    { address = 0x8397A978, size = 0x154 },
+    { address = 0x8399BD48, size = 0x174 },
+    { address = 0x839ED3F0, size = 0xA4 },
+    { address = 0x83A0F3F0, size = 0x270 },
+    { address = 0x822CBD20, size = 0xC4 }, # reached only through function pointers
+    { address = 0x822CBDE8, size = 0x44 }, # reached only through function pointers
+    { address = 0x822D23F8, size = 0x1C }, # reached only through function pointers
+    { address = 0x822D2418, size = 0xEC }, # reached only through function pointers
+    { address = 0x82C6B3D8, size = 0x5E4 }, # reached only through function pointers
+    { address = 0x82C72F58, size = 0x1C }, # reached only through function pointers
+    { address = 0x82C72F78, size = 0x14 }, # reached only through function pointers
+    { address = 0x830A3F28, size = 0x24 }, # reached only through function pointers
+    { address = 0x830F0A18, size = 0x8 }, # reached only through function pointers
+    { address = 0x835AA050, size = 0x440 }, # reached only through function pointers
+]
+
+# Functions that keep all registers in ctx although the *_as_local options are on
+# (XenonRecomp patch, see analysis/XenonRecomp-crysis2.patch): they read registers
+# their caller set beyond the calling convention -- SEH __finally funclets called
+# directly by their parent (frame in r12, parent registers), function tails split
+# off by the analysis -- plus those functions direct callers, and setjmp callers
+# (longjmp must restore r14-r31). Found by a liveness check over the all-ctx output.
+ctx_functions = [
+    0x8232A728, 0x8232A7B0, 0x82378418, 0x82420F40, 0x82425C68, 0x8296D1C0,
+    0x82970A08, 0x829DC878, 0x829F8D60, 0x83161D08, 0x8347A878, 0x8347AFE0,
+    0x8347AFE8, 0x8347B14C, 0x8347B16C, 0x8347B3B0, 0x8347B3B8, 0x8347B44C,
+    0x8347B46C, 0x8347B6C8, 0x8347B6D0, 0x8347B754, 0x8347B774, 0x8347BA50,
+    0x8347BA58, 0x8347BAFC, 0x8347BB1C, 0x8347BB58, 0x8347BB60, 0x8347BC64,
+    0x8347BC84, 0x8347C090, 0x8347C098, 0x8347C14C, 0x8347C16C, 0x8347C2E0,
+    0x8347C2E8, 0x8347C478, 0x8347CA00, 0x8347CA08, 0x8347CD08, 0x8347CD28,
+    0x8347D090, 0x8347D098, 0x8347D274, 0x8347D294, 0x8347D4A8, 0x8347D4B0,
+    0x8347D578, 0x8347D5D8, 0x8347D5E0, 0x8347D81C, 0x8347D970, 0x8347D978,
+    0x8347DAC0, 0x8347DAEC, 0x8347DB50, 0x8347DB58, 0x8347DBF4, 0x8347DC14,
+    0x8347DEC0, 0x8347DEC8, 0x8347DF5C, 0x8347DF7C, 0x8347E048, 0x8347E050,
+    0x8347E1CC, 0x8347E220, 0x8347E228, 0x8347E384, 0x8347E3A4, 0x8347E588,
+    0x8347E590, 0x8347E604, 0x8347E624, 0x8347EB20, 0x834800F8, 0x83480100,
+    0x83480278, 0x83480298, 0x834803D8, 0x83481B28, 0x83481B30, 0x83481CE0,
+    0x83481D00, 0x83481D38, 0x83481D40, 0x83481E18, 0x83481E38, 0x83481E78,
+    0x83481E80, 0x8348208C, 0x834820A8, 0x83484360, 0x83484B60, 0x83484DF8,
+    0x83484E00, 0x8348509C, 0x834850BC, 0x83485140, 0x83485148, 0x834852AC,
+    0x834852CC, 0x83485368, 0x83485370, 0x834854B0, 0x83486570, 0x8348A818,
+    0x8348A820, 0x8348AAA8, 0x8348AAC8, 0x8348ACF0, 0x8348AD34, 0x8348AE10,
+    0x8348AE18, 0x8348AF28, 0x8348AFB8, 0x8348BE58, 0x8348BE60, 0x8348BF84,
+    0x8348BFA4, 0x8348C0C0, 0x8348C0C8, 0x8348C1D0, 0x8348C1F0, 0x8348C4C8,
+    0x8348CE70, 0x8348CE78, 0x8348CFC8, 0x8348CFE8, 0x8348D228, 0x8348DD28,
+    0x8348DD30, 0x8348DE54, 0x8348DE74, 0x8348DEB0, 0x8348DEB8, 0x8348DFD0,
+    0x8348DFF0, 0x8348E130, 0x8348E858, 0x8348E8F8, 0x834916A8, 0x834916B0,
+    0x834917B0, 0x834917DC, 0x83491EA8, 0x83491EB0, 0x83491F8C, 0x83491FAC,
+    0x83494A80, 0x83494A88, 0x83494BB0, 0x83494BD0, 0x83499A98, 0x83499B38,
+    0x8349A068, 0x8349A070, 0x8349A8F0, 0x8349A918, 0x8349A960, 0x8349A968,
+    0x8349ABE4, 0x8349AC0C, 0x8349AC58, 0x8349AC60, 0x8349B30C, 0x8349B344,
+    0x8349B484, 0x8349B4A8, 0x8349B4C8, 0x834A55D0, 0x834B00F8, 0x834C8088,
+    0x83669048, 0x83669094, 0x836690C0, 0x83669104, 0x83669130, 0x8366917C,
+    0x836691A8, 0x836691F4, 0x836765F0, 0x8367668C, 0x836766A4, 0x836766D0,
+    0x83676724, 0x83676760, 0x836767C0, 0x836767F8, 0x83676858, 0x83683530,
+    0x83683578, 0x83683588, 0x8369C638, 0x8369C680, 0x8369F090, 0x8369F0D8,
+    0x8369F0EC, 0x836F8848, 0x836F8A68, 0x8372C0B0, 0x8372CCB4, 0x83733D38,
+    0x837D3768, 0x837D3828, 0x837D64B0, 0x837D6510, 0x837D654C, 0x837D6A10,
+    0x837D6E70, 0x837D6E78, 0x837D6F90, 0x837D6FD0, 0x837D6FD8, 0x837D70F0,
+    0x837F0288, 0x837F03AC, 0x837F03B4, 0x837F03D0, 0x838A56F0, 0x838A5CC0,
+    0x83A11A90, 0x83A11A98, 0x83A11B94, 0x83A11BC8, 0x83A11BD0, 0x83A11CD4,
+    0x83A11CF4, 0x83A12998, 0x83A129A0, 0x83A12A7C, 0x83A12A9C, 0x83A15460,
+    0x83A15660, 0x83A1572C, 0x83A15B50, 0x83A15B58, 0x83A15D3C, 0x83A15D50,
+]

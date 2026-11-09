@@ -1,0 +1,118 @@
+# XenonRecomp configuration for Crysis 2 (Xbox 360, title 454108E3, version 0.0.0.2)
+# Paths are relative to this file.
+
+[main]
+file_path = "../../extracted/default.xex"
+out_directory_path = "../ppc"
+switch_table_file_path = "Crysis2_switch_tables.toml"
+
+# Optimizations stay off until a recompilation runs correctly.
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Register save/restore helpers, found by the byte signatures in XenonRecomp's README
+# (each matched exactly once in .text).
+restgprlr_14_address = 0x8347A120
+savegprlr_14_address = 0x8347A0D0
+restfpr_14_address = 0x8347A7BC
+savefpr_14_address = 0x8347A770
+restvmx_14_address = 0x83487458
+savevmx_14_address = 0x834871C0
+restvmx_64_address = 0x834874EC
+savevmx_64_address = 0x83487254
+
+# longjmp: restores FPRs/VMX from the buffer, then LR (+308), r1 (+144) and CR (+304),
+# returning the value argument (or 1); its other path calls RtlUnwind.
+# setjmp: leaf function directly before it, saving those same buffer slots and returning 0.
+longjmp_address = 0x83484630
+setjmp_address = 0x83484360
+
+invalid_instructions = [
+    { data = 0x00000000, size = 4 }, # Padding between functions
+]
+
+# Leaf functions (no .pdata entry) containing jump tables. XenonRecomp's own boundary
+# analysis stops at the first bctr in these, so their bounds are given explicitly:
+# the gap between .pdata entries, split at bl targets, minus zero padding.
+functions = [
+    { address = 0x822A6808, size = 0xF4 },
+    { address = 0x822CBD18, size = 0x114 },
+    { address = 0x822D23F0, size = 0x114 },
+    { address = 0x822ED448, size = 0x9C },
+    { address = 0x8231B6B0, size = 0x114 },
+    { address = 0x82348760, size = 0x74 },
+    { address = 0x824D0260, size = 0x9C },
+    { address = 0x826FD6B8, size = 0xCC },
+    { address = 0x82832DE0, size = 0x1C8 },
+    { address = 0x82847290, size = 0x140 },
+    { address = 0x82856100, size = 0x27C },
+    { address = 0x8286D3D8, size = 0x150 },
+    { address = 0x8286D528, size = 0x154 },
+    { address = 0x82874C78, size = 0x248 },
+    { address = 0x828765C8, size = 0x810 },
+    { address = 0x828EC180, size = 0x104 },
+    { address = 0x828EC348, size = 0x274 },
+    { address = 0x828ED178, size = 0x1EC },
+    { address = 0x828FAAE8, size = 0x198 },
+    { address = 0x82957790, size = 0x120 },
+    { address = 0x82A9A650, size = 0x108 },
+    { address = 0x82BDAB78, size = 0xB8 },
+    { address = 0x82C58820, size = 0x4D4 },
+    { address = 0x82C59670, size = 0xB0 },
+    { address = 0x82C69AA0, size = 0x4D4 },
+    { address = 0x82C6AFE0, size = 0x9DC },
+    { address = 0x82C72A80, size = 0x50C },
+    { address = 0x82C74690, size = 0x4D4 },
+    { address = 0x82C86220, size = 0x4D4 },
+    { address = 0x82C88250, size = 0x4D4 },
+    { address = 0x82C8A210, size = 0x4D4 },
+    { address = 0x82C8B088, size = 0x4D4 },
+    { address = 0x82CB1F60, size = 0x4D4 },
+    { address = 0x82CB2928, size = 0x4D4 },
+    { address = 0x82CB3190, size = 0x4D4 },
+    { address = 0x82CB39E0, size = 0x4D4 },
+    { address = 0x830A3EA8, size = 0xA4 },
+    { address = 0x830F09A0, size = 0x80 },
+    { address = 0x831779E0, size = 0x8C },
+    { address = 0x831A7598, size = 0x454 },
+    { address = 0x831BBF20, size = 0x88 },
+    { address = 0x831CAE50, size = 0x13C },
+    { address = 0x8324C748, size = 0xC4 },
+    { address = 0x8334E3E8, size = 0x114 },
+    { address = 0x833ABB38, size = 0x46C },
+    { address = 0x834FC768, size = 0x188 },
+    { address = 0x835AA048, size = 0x448 },
+    { address = 0x8366CA30, size = 0x2E8 },
+    { address = 0x83736AB8, size = 0x114 },
+    { address = 0x83785708, size = 0x110 },
+    { address = 0x837E7E70, size = 0xC8 },
+    { address = 0x838E5410, size = 0x68 },
+    { address = 0x838E5478, size = 0x64 },
+    { address = 0x838E54E0, size = 0x5C },
+    { address = 0x838E5540, size = 0x198 },
+    { address = 0x838E56D8, size = 0x16C },
+    { address = 0x838FBBC0, size = 0xFC },
+    { address = 0x83914190, size = 0xDC },
+    { address = 0x8392E608, size = 0x784 },
+    { address = 0x8395AE88, size = 0x1D4 },
+    { address = 0x8397A978, size = 0x154 },
+    { address = 0x8399BD48, size = 0x174 },
+    { address = 0x839ED3F0, size = 0xA4 },
+    { address = 0x83A0F3F0, size = 0x270 },
+    { address = 0x822CBD20, size = 0xC4 }, # reached only through function pointers
+    { address = 0x822CBDE8, size = 0x44 }, # reached only through function pointers
+    { address = 0x822D23F8, size = 0x1C }, # reached only through function pointers
+    { address = 0x822D2418, size = 0xEC }, # reached only through function pointers
+    { address = 0x82C6B3D8, size = 0x5E4 }, # reached only through function pointers
+    { address = 0x82C72F58, size = 0x1C }, # reached only through function pointers
+    { address = 0x82C72F78, size = 0x14 }, # reached only through function pointers
+    { address = 0x830A3F28, size = 0x24 }, # reached only through function pointers
+    { address = 0x830F0A18, size = 0x8 }, # reached only through function pointers
+    { address = 0x835AA050, size = 0x440 }, # reached only through function pointers
+]

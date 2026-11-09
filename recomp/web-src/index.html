@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0b0d0c">
+<title>Crysis 2 (recompiled)</title>
+<style>
+  :root {
+    --bg: #0b0d0c; --panel: #151918; --line: #2a302e; --text: #d6ddd9; --dim: #8a948f;
+    --accent: #7fd1a8; --accent-dim: #3c6f57; --warn: #e2b55b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; overscroll-behavior: none;
+    overflow: hidden; } /* the page itself never scrolls (no flickering scrollbars) */
+  body { display: flex; flex-direction: column; }
+  #view { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { background: #000; width: 100%; height: 100%; max-width: 100%; max-height: 100%; display: block; touch-action: none;
+    object-fit: contain; } /* keep 16:9, letterboxed */
+
+  /* Loading screen */
+  #loader { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse at center, #141a17 0%, var(--bg) 70%); z-index: 5; padding: 16px; }
+  #loader.hidden { display: none; }
+  .card { width: min(520px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 22px; }
+  .card h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; letter-spacing: .02em; }
+  .card p { margin: 0 0 18px; color: var(--dim); font-size: 13px; }
+  .step { margin: 14px 0; }
+  .step .row { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; margin-bottom: 6px; }
+  .step .label { font-weight: 600; }
+  .step .detail { color: var(--dim); font-variant-numeric: tabular-nums; text-align: right; }
+  .step.pending { opacity: .45; }
+  .step.done .label::after { content: "  ✓"; color: var(--accent); }
+  .bar { height: 8px; background: #0e1211; border: 1px solid var(--line); border-radius: 99px; overflow: hidden; position: relative; }
+  .bar > i { position: absolute; inset: 0 auto 0 0; width: 0; background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+    border-radius: 99px; transition: width .2s ease-out; }
+  .bar.indeterminate > i { width: 35%; animation: slide 1.1s ease-in-out infinite; }
+  @keyframes slide { from { left: -35%; } to { left: 100%; } }
+  #error { color: var(--warn); font-size: 13px; margin-top: 12px; display: none; white-space: pre-wrap; }
+
+  /* Disc streaming indicator (top of the game view) */
+  #stream { position: absolute; top: 0; left: 0; right: 0; height: 3px; z-index: 4; opacity: 0; transition: opacity .3s; pointer-events: none; }
+  #stream.active { opacity: 1; }
+  #stream > i { position: absolute; top: 0; bottom: 0; width: 30%; background: var(--accent); animation: slide 1s linear infinite; }
+  #disc { position: absolute; top: 8px; right: 8px; z-index: 4; font-size: 12px; color: var(--dim); background: rgba(11,13,12,.75);
+    border: 1px solid var(--line); border-radius: 99px; padding: 3px 10px; font-variant-numeric: tabular-nums; pointer-events: none; display: none; }
+  #disc.active { color: var(--accent); }
+
+  /* Bottom bar and log */
+  #bar { display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: var(--panel); border-top: 1px solid var(--line); font-size: 13px; }
+  #status { flex: 1; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #bar button { background: #1d2321; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; font: inherit; cursor: pointer; }
+  #log { height: 26vh; overflow: auto; margin: 0; padding: 6px 10px; background: #070908; color: #9a9; font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; }
+  #log.hidden { display: none; }
+  /* The status/key-binding bar and the log are debugging aids: hidden unless
+     turned on from the browser console with crysis.debug(). */
+  body:not(.debug) #bar, body:not(.debug) #log { display: none; }
+  #fsbtn { position: absolute; top: 40px; right: 8px; z-index: 4; width: 30px; height: 30px; border-radius: 8px;
+    background: rgba(11,13,12,.6); border: 1px solid var(--line); color: var(--dim); font-size: 16px; line-height: 1;
+    cursor: pointer; opacity: .55; transition: opacity .2s; }
+  #fsbtn:hover { opacity: 1; color: var(--text); }
+  body.touch #fsbtn { top: 58px; right: 12px; }
+  /* Mouse capture hint (desktop, while the game runs and the pointer is free) */
+  #mousehint { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 4; display: none;
+    font-size: 12px; color: var(--text); background: rgba(11,13,12,.78); border: 1px solid var(--line); border-radius: 99px;
+    padding: 4px 12px; pointer-events: none; white-space: nowrap; }
+  body.running:not(.touch):not(.locked) #mousehint { display: block; }
+  body.locked canvas { cursor: none; }
+
+  /* Touch controls */
+  #touch { position: absolute; inset: 0; z-index: 3; pointer-events: none; display: none; user-select: none; -webkit-user-select: none; }
+  body.touch #touch { display: block; }
+  .tc { position: absolute; pointer-events: auto; touch-action: none; display: flex; align-items: center; justify-content: center;
+    background: rgba(20,26,23,.45); border: 1.5px solid rgba(214,221,217,.35); color: rgba(214,221,217,.9);
+    font-weight: 700; font-size: 15px; border-radius: 50%; -webkit-tap-highlight-color: transparent; }
+  .tc.on { background: rgba(127,209,168,.45); border-color: var(--accent); }
+  .face { width: 52px; height: 52px; }
+  .face.a { color: #7fd17f; } .face.b { color: #e07070; } .face.x { color: #70a8e0; } .face.y { color: #e0c870; }
+  .shoulder { width: 64px; height: 38px; border-radius: 10px; font-size: 13px; }
+  .small { width: 56px; height: 30px; border-radius: 15px; font-size: 11px; }
+  .dpad { width: 42px; height: 42px; border-radius: 8px; font-size: 13px; }
+  .stick { width: 128px; height: 128px; background: rgba(20,26,23,.3); }
+  .stick .knob { position: absolute; left: 50%; top: 50%; width: 56px; height: 56px; margin: -28px 0 0 -28px; border-radius: 50%;
+    background: rgba(214,221,217,.35); border: 1.5px solid rgba(214,221,217,.5); pointer-events: none; }
+  .stick.on .knob { background: rgba(127,209,168,.55); }
+  #rotate { position: absolute; inset: 0; z-index: 6; display: none; align-items: center; justify-content: center; text-align: center;
+    background: rgba(11,13,12,.9); padding: 24px; color: var(--dim); }
+  @media (orientation: portrait) { body.touch.running #rotate { display: flex; } }
+  body.touch #log { height: 20vh; }
+  body.touch #disc { top: auto; right: auto; bottom: 8px; left: 50%; transform: translateX(-50%); }
+</style>
+</head>
+<body>
+<div id="view">
+  <canvas id="screen" width="1280" height="720"></canvas>
+  <div id="stream"><i></i></div>
+  <div id="disc">Disc 0 MB</div>
+  <button id="fsbtn" type="button" title="Fullscreen (or double-click the game)">⛶</button>
+  <div id="mousehint">Click the game to use the mouse · Esc gives it back · F1: settings</div>
+
+  <div id="touch">
+    <!-- Shoulders and triggers -->
+    <div class="tc shoulder" data-axis="5" style="left:12px; top:12px">LT</div>
+    <div class="tc shoulder" data-btn="256" style="left:84px; top:12px">LB</div>
+    <div class="tc shoulder" data-btn="512" style="right:84px; top:12px">RB</div>
+    <div class="tc shoulder" data-axis="6" style="right:12px; top:12px">RT</div>
+    <!-- Back / Start -->
+    <div class="tc small" data-btn="32" style="left:calc(50% - 64px); top:14px">BACK</div>
+    <div class="tc small" data-btn="16" style="left:calc(50% + 8px); top:14px">START</div>
+    <!-- D-pad -->
+    <div class="tc dpad" data-btn="1" style="left:62px; bottom:200px">▲</div>
+    <div class="tc dpad" data-btn="2" style="left:62px; bottom:112px">▼</div>
+    <div class="tc dpad" data-btn="4" style="left:18px; bottom:156px">◀</div>
+    <div class="tc dpad" data-btn="8" style="left:106px; bottom:156px">▶</div>
+    <!-- Face buttons -->
+    <div class="tc face y" data-btn="32768" style="right:68px; bottom:220px">Y</div>
+    <div class="tc face x" data-btn="16384" style="right:124px; bottom:166px">X</div>
+    <div class="tc face b" data-btn="8192" style="right:12px; bottom:166px">B</div>
+    <div class="tc face a" data-btn="4096" style="right:68px; bottom:112px">A</div>
+    <!-- Sticks (tap = stick click) -->
+    <div class="tc stick" data-stick="left" data-click="64" style="left:150px; bottom:14px"><div class="knob"></div></div>
+    <div class="tc stick" data-stick="right" data-click="128" style="right:190px; bottom:14px"><div class="knob"></div></div>
+  </div>
+
+  <div id="loader">
+    <div class="card">
+      <h1>Crysis 2 — recompiled</h1>
+      <p>Runs locally from your own disc image. Nothing is installed.</p>
+      <div class="step" id="s-download">
+        <div class="row"><span class="label">Downloading game code</span><span class="detail" id="d-download">starting…</span></div>
+        <div class="bar"><i id="b-download"></i></div>
+      </div>
+      <div class="step pending" id="s-compile">
+        <div class="row"><span class="label">Compiling</span><span class="detail" id="d-compile">waiting</span></div>
+        <div class="bar"><i id="b-compile"></i></div>
+      </div>
+      <div class="step pending" id="s-boot">
+        <div class="row"><span class="label">Starting and reading the disc</span><span class="detail" id="d-boot">waiting</span></div>
+        <div class="bar"><i id="b-boot"></i></div>
+      </div>
+      <div id="error"></div>
+    </div>
+  </div>
+  <div id="rotate">Turn your device sideways to play.</div>
+</div>
+<div id="bar">
+  <span id="status">Loading…</span>
+  <button id="fs" type="button">Fullscreen</button>
+  <button id="toggle-log" type="button">Log</button>
+</div>
+<pre id="log"></pre>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const status = $('status'), logEl = $('log');
+  const lines = [];
+  let logDirty = false;
+  // Debug panels (status/key bindings and log): off by default; the choice is remembered.
+  let debugOn = false;
+  try { debugOn = localStorage.getItem('crysisDebug') === '1'; } catch (e) {}
+  document.body.classList.toggle('debug', debugOn);
+  const controlsHelp = 'Enter: START · Tab: BACK · Space: A · Esc: B · R: X · F: Y · arrows: D-pad · WASD: left stick · ' +
+    'IJKL: right stick · Q/E: LB/RB · Shift/Ctrl: LT/RT · C/V: stick clicks · ' +
+    'mouse (click the game to capture it): look, left: RT, right: LT, middle: right-stick click, wheel: Y, side buttons: LB/RB · ' +
+    'F1 or the gear button: settings (rebind keys, mouse)';
+  window.crysis = {
+    debug(on = !debugOn) {
+      debugOn = !!on;
+      document.body.classList.toggle('debug', debugOn);
+      try { localStorage.setItem('crysisDebug', debugOn ? '1' : '0'); } catch (e) {}
+      return debugOn ? 'Log and key-binding panels shown (runtime log also goes to the console).' : 'Debug panels hidden.';
+    },
+    controls: controlsHelp,
+    log: () => (window.allLog || []).slice(-200).join('\n'),
+  };
+  console.info('Crysis 2 (recompiled). Controls: ' + controlsHelp +
+    '\nRun crysis.debug() to show the log and key-binding panels (crysis.debug(false) hides them).');
+
+  function log(text) {
+    if (debugOn) console.log(text);
+    (window.allLog ||= []).push(text);
+    if (window.allLog.length > 50000) window.allLog.splice(0, 10000);
+    lines.push(text);
+    if (lines.length > 400) lines.splice(0, lines.length - 400);
+    if (!logDirty) { logDirty = true; requestAnimationFrame(() => {
+      logDirty = false; logEl.textContent = lines.join('\n'); logEl.scrollTop = logEl.scrollHeight; }); }
+  }
+
+  // ---- Touch detection --------------------------------------------------
+  const isTouch = matchMedia('(pointer: coarse)').matches || ('ontouchstart' in window && navigator.maxTouchPoints > 0);
+  if (isTouch) { document.body.classList.add('touch'); logEl.classList.add('hidden'); }
+  $('toggle-log').onclick = () => logEl.classList.toggle('hidden');
+  const toggleFullscreen = async () => {
+    try {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen({ navigationUI: 'hide' });
+        try { await screen.orientation.lock('landscape'); } catch (e) {}
+      } else await document.exitFullscreen();
+    } catch (e) {}
+  };
+  $('fs').onclick = toggleFullscreen;
+  $('fsbtn').onclick = toggleFullscreen;
+  // (Not while the mouse is captured: then clicks are the game's buttons.)
+  $('screen').addEventListener('dblclick', () => { if (document.pointerLockElement !== $('screen')) toggleFullscreen(); });
+
+  // ---- Loading screen helpers ------------------------------------------
+  const fmtMB = (b) => (b / 1048576).toFixed(b < 10485760 ? 1 : 0) + ' MB';
+  function setStep(name, state, detail, fraction) {
+    const step = $('s-' + name), bar = $('b-' + name).parentElement, fill = $('b-' + name);
+    step.classList.toggle('pending', state === 'pending');
+    step.classList.toggle('done', state === 'done');
+    if (detail !== undefined) $('d-' + name).textContent = detail;
+    bar.classList.toggle('indeterminate', fraction === null);
+    if (fraction !== null && fraction !== undefined) fill.style.width = (Math.max(0, Math.min(1, fraction)) * 100).toFixed(1) + '%';
+    else if (fraction === null) fill.style.width = '';
+  }
+  function fail(message) {
+    const e = $('error'); e.style.display = 'block'; e.textContent = message;
+    status.textContent = message;
+  }
+
+  if (!crossOriginIsolated) fail('This page needs cross-origin isolation. Serve it with recomp/serve.py.');
+  if (!navigator.gpu) fail('This browser has no WebGPU. Use a recent Chrome or Edge (desktop or Android).');
+
+  // ---- Game code: from this browser's cache, or downloaded with progress ----
+  // crysis2.wasm (about 210 MB) is kept in Cache Storage and checked against
+  // the server's ETag, so it's downloaded again only after a rebuild.
+  // Compiling streams from the cached copy, which also lets the browser keep
+  // its compiled code for the next visit. Returns a Response to compile, or
+  // bytes when caching isn't available.
+  const CODE_CACHE = 'crysis-code-v1';
+  async function loadWasm(url) {
+    let cache = null, etag = null;
+    try { cache = await caches.open(CODE_CACHE); } catch (e) {}
+    if (cache) {
+      try { etag = (await fetch(url, { method: 'HEAD', cache: 'no-store' })).headers.get('ETag'); } catch (e) {}
+      const hit = await cache.match(url).catch(() => null);
+      if (hit && etag && hit.headers.get('ETag') === etag) {
+        setStep('download', 'done', 'from this browser (' + fmtMB(Number(hit.headers.get('Content-Length')) || 0) + ')', 1);
+        return hit;
+      }
+    }
+    const response = await fetch(url, { cache: 'no-store' });
+    if (!response.ok) throw new Error('Download failed: HTTP ' + response.status);
+    const total = Number(response.headers.get('Content-Length')) || 0;
+    // Store a copy while reading the other for progress (and for compiling
+    // without the cache, should storing fail).
+    let stored = null;
+    if (cache) stored = cache.put(url, response.clone()).then(() => true, (e) => { log('[cache] could not keep the game code: ' + e); return false; });
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0, lastT = performance.now(), lastB = 0, speed = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!cache) chunks.push(value);
+      received += value.length;
+      const now = performance.now();
+      if (now - lastT > 400) { speed = (received - lastB) / ((now - lastT) / 1000); lastT = now; lastB = received; }
+      const eta = speed > 0 && total ? Math.ceil((total - received) / speed) + ' s left' : '';
+      setStep('download', 'active',
+        fmtMB(received) + (total ? ' / ' + fmtMB(total) : '') + (speed ? ' · ' + fmtMB(speed) + '/s' : '') + (eta ? ' · ' + eta : ''),
+        total ? received / total : null);
+      status.textContent = 'Downloading game code… ' + (total ? Math.floor(received * 100 / total) + '%' : fmtMB(received));
+    }
+    setStep('download', 'done', fmtMB(received), 1);
+    if (cache) {
+      setStep('download', 'done', fmtMB(received) + ' · saving for next time…', 1);
+      const ok = await stored;
+      const hit = ok ? await cache.match(url).catch(() => null) : null;
+      setStep('download', 'done', fmtMB(received) + (hit ? ' · kept for next time' : ''), 1);
+      if (hit) return hit;
+      return fetch(url, { cache: 'no-store' }); // storing failed: compile from the network
+    }
+    const bytes = new Uint8Array(received);
+    let offset = 0;
+    for (const c of chunks) { bytes.set(c, offset); offset += c.length; }
+    return bytes;
+  }
+
+  // ---- Disc streaming indicator ------------------------------------------
+  let discTimer = 0, lastDisc = 0, bootDone = false;
+  function pollDisc() {
+    if (!Module._crysis_disc_bytes) return;
+    const bytes = Module._crysis_disc_bytes(), busy = Module._crysis_disc_busy() > 0 || bytes !== lastDisc;
+    const rate = (bytes - lastDisc) * 2; // polled every 500 ms
+    lastDisc = bytes;
+    $('stream').classList.toggle('active', busy);
+    const disc = $('disc');
+    disc.style.display = 'block';
+    disc.classList.toggle('active', busy);
+    disc.textContent = 'Disc ' + fmtMB(bytes) + (busy && rate > 0 ? ' · ' + fmtMB(rate) + '/s' : '');
+    if (!bootDone) setStep('boot', 'active', fmtMB(bytes) + ' read', null);
+  }
+  // The loader closes once the game presents its first rendered frame.
+  function watchFirstFrame() {
+    const t = setInterval(() => {
+      const presented = (window.allLog || []).some(l => l.includes('render: executed frame'));
+      if (presented) {
+        clearInterval(t);
+        bootDone = true;
+        setStep('boot', 'done', fmtMB(lastDisc) + ' read', 1);
+        setTimeout(() => $('loader').classList.add('hidden'), 400);
+        document.body.classList.add('running');
+        status.textContent = isTouch ? 'Running — use the on-screen controls' :
+          'Running — click to use the mouse (look, left fire, right aim) · F1: settings and key bindings · Enter: START · ' +
+          'Space: A · Esc: B · WASD: move';
+      }
+    }, 500);
+  }
+
+  // The disc: an extracted folder at /disc/ (each file fetched only when the game
+  // opens it), or else a disc image at /disc.iso.
+  function discArgument() {
+    try {
+      const probe = new XMLHttpRequest();
+      probe.open('HEAD', '/disc/disc-index.txt', false);
+      probe.send(null);
+      if (probe.status === 200) return 'url:' + location.origin + '/disc/';
+    } catch (e) {}
+    return 'url:' + location.origin + '/disc.iso';
+  }
+
+  var Module = {
+    arguments: [discArgument()],
+    print: log,
+    printErr: log,
+    setStatus: (s) => { if (s) log('[status] ' + s); },
+    monitorRunDependencies: () => {},
+    // Diagnostics: ?env=NAME=value&env=NAME2=value2 sets runtime environment variables.
+    preRun: [() => {
+      // Frame rate (settings panel). The console version holds itself to 30 fps:
+      // its own limiter (sys_MaxFPS) and presenting every second 60 Hz vblank.
+      // "Up to 60" (the default) raises the limiter to 60 and runs the emulated
+      // vblank at 120 Hz; the game times everything else with its own clock.
+      let video = {};
+      try { video = JSON.parse(localStorage.getItem('crysisVideo') || '{}') || {}; } catch (e) {}
+      if (video.fps !== 30) { ENV.VBLANK_HZ = '120'; ENV.GAME_CVARS = 'sys_MaxFPS=60'; }
+      for (const kv of new URLSearchParams(location.search).getAll('env')) {
+        const i = kv.indexOf('=');
+        if (i > 0) ENV[kv.slice(0, i)] = kv.slice(i + 1);
+      }
+    }, () => {
+      // Saved games from this browser go back in before the game starts (saves.js).
+      if (window.crysisSaves) crysisSaves.preRun();
+    }],
+    instantiateWasm(imports, receiveInstance) {
+      loadWasm('crysis2.wasm').then(async (code) => {
+        setStep('compile', 'active', 'compiling 220 MB of code (can take a minute)…', null);
+        status.textContent = 'Compiling game code…';
+        const t0 = performance.now();
+        const { instance, module } = code instanceof Response
+          ? await WebAssembly.instantiateStreaming(code, imports)
+          : await WebAssembly.instantiate(code, imports);
+        setStep('compile', 'done', ((performance.now() - t0) / 1000).toFixed(1) + ' s', 1);
+        setStep('boot', 'active', 'starting…', null);
+        status.textContent = 'Starting the game and reading the disc…';
+        receiveInstance(instance, module);
+      }).catch((e) => fail(String(e && e.message || e)));
+      return {};
+    },
+    onRuntimeInitialized: () => {
+      discTimer = setInterval(pollDisc, 500);
+      watchFirstFrame();
+      if (window.crysisControls) crysisControls.onRuntime(); // mouse settings (controls.js)
+    },
+  };
+
+  // ---- Touch controls ----------------------------------------------------
+  function pad(fn, ...args) { if (Module[fn]) Module[fn](...args); }
+  for (const el of document.querySelectorAll('#touch .tc')) {
+    const btn = Number(el.dataset.btn || 0), axis = Number(el.dataset.axis || 0);
+    if (el.dataset.stick) {
+      const side = el.dataset.stick, ax = side === 'left' ? 1 : 3, knob = el.querySelector('.knob');
+      let id = null, cx = 0, cy = 0, moved = false;
+      const radius = 50;
+      const update = (x, y) => {
+        let dx = x - cx, dy = y - cy;
+        const len = Math.hypot(dx, dy);
+        if (len > radius) { dx *= radius / len; dy *= radius / len; }
+        if (len > 8) moved = true;
+        knob.style.transform = `translate(${dx}px, ${dy}px)`;
+        pad('_crysis_touch_axis', ax, dx / radius);
+        pad('_crysis_touch_axis', ax + 1, -dy / radius);
+      };
+      el.addEventListener('pointerdown', (e) => {
+        if (id !== null) return;
+        id = e.pointerId; el.setPointerCapture(id); el.classList.add('on'); moved = false;
+        const r = el.getBoundingClientRect(); cx = r.left + r.width / 2; cy = r.top + r.height / 2;
+        update(e.clientX, e.clientY); e.preventDefault();
+      });
+      el.addEventListener('pointermove', (e) => { if (e.pointerId === id) update(e.clientX, e.clientY); });
+      const end = (e) => {
+        if (e.pointerId !== id) return;
+        id = null; el.classList.remove('on'); knob.style.transform = '';
+        pad('_crysis_touch_axis', ax, 0); pad('_crysis_touch_axis', ax + 1, 0);
+        if (!moved) { // a tap clicks the stick
+          const click = Number(el.dataset.click);
+          pad('_crysis_touch_buttons', click, 1);
+          setTimeout(() => pad('_crysis_touch_buttons', click, 0), 120);
+        }
+      };
+      el.addEventListener('pointerup', end);
+      el.addEventListener('pointercancel', end);
+      continue;
+    }
+    const press = (down) => {
+      el.classList.toggle('on', down);
+      if (btn) pad('_crysis_touch_buttons', btn, down ? 1 : 0);
+      if (axis) pad('_crysis_touch_axis', axis, down ? 1 : 0);
+      if (down && navigator.vibrate) navigator.vibrate(8);
+    };
+    el.addEventListener('pointerdown', (e) => { el.setPointerCapture(e.pointerId); press(true); e.preventDefault(); });
+    el.addEventListener('pointerup', () => press(false));
+    el.addEventListener('pointercancel', () => press(false));
+    el.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  status.textContent = 'Downloading game code…';
+</script>
+<script src="controls.js"></script>
+<script src="saves.js"></script>
+<script>
+  // Disc data cache (sw.js). The service worker has to control this page
+  // before the game's worker threads start, so their disc reads go through it
+  // (on the very first visit too): register it, wait until it takes over,
+  // then load the game.
+  (async () => {
+    if ('serviceWorker' in navigator) {
+      try {
+        await navigator.serviceWorker.register('sw.js');
+        if (!navigator.serviceWorker.controller)
+          await Promise.race([
+            new Promise((r) => navigator.serviceWorker.addEventListener('controllerchange', r, { once: true })),
+            new Promise((r) => setTimeout(r, 4000)),
+          ]);
+        // Ask the browser not to evict the stored game data under storage pressure.
+        if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+      } catch (e) { log('[cache] disc caching unavailable: ' + e); }
+    }
+    const script = document.createElement('script');
+    script.src = 'crysis2.js';
+    document.body.appendChild(script);
+  })();
+</script>
+</body>
+</html>
