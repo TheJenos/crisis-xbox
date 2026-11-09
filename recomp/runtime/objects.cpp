@@ -115,6 +115,8 @@ namespace
     // PROFILE: zero-time yields by (thread id, return address, two callers).
     std::mutex g_yieldSitesMutex;
     std::map<std::array<uint32_t, 4>, uint64_t> g_yieldSites;
+    // PROFILE: non-zero sleeps by the same key: nanoseconds slept.
+    std::map<std::array<uint32_t, 4>, uint64_t> g_sleepSites;
 }
 
 namespace
@@ -459,6 +461,20 @@ static void StartProfiler()
                     Log("PROFILE yields t%u: %.0f/s at %08X (in %08X) <- %08X (in %08X) <- %08X (in %08X)", k[0],
                         top[i].first / secs, k[1], funcOf(k[1]), k[2], funcOf(k[2]), k[3], funcOf(k[3]));
                 }
+                // Where the time in non-zero sleeps goes (Sleep(n) waits).
+                top.clear();
+                {
+                    std::lock_guard lock(g_yieldSitesMutex);
+                    for (auto& [k, n] : g_sleepSites) top.push_back({ n, k });
+                    g_sleepSites.clear();
+                }
+                std::sort(top.rbegin(), top.rend());
+                for (size_t i = 0; i < top.size() && i < 6; i++)
+                {
+                    const auto& k = top[i].second;
+                    Log("PROFILE sleeps t%u: %.0f ms/s at %08X (in %08X) <- %08X (in %08X) <- %08X (in %08X)", k[0],
+                        top[i].first / 1e6 / secs, k[1], funcOf(k[1]), k[2], funcOf(k[2]), k[3], funcOf(k[3]));
+                }
             }
             start = now;
         }
@@ -574,6 +590,23 @@ GUEST_IMPORT(KeDelayExecutionThread)
             t->sleepActNs.fetch_add(took, std::memory_order_relaxed);
             if (took > t->sleepMaxNs.load(std::memory_order_relaxed))
                 t->sleepMaxNs.store(took, std::memory_order_relaxed);
+            if (prof::Enabled())
+            {
+                std::array<uint32_t, 4> key{ t->id, uint32_t(ctx.lr), 0, 0 };
+                uint32_t frame = ctx.r1.u32;
+                for (int k = 2; k < 4; k++)
+                {
+                    if (frame < t->stackLimit || frame + 4 > t->stackBase)
+                        break;
+                    uint32_t next = Load<uint32_t>(frame);
+                    if (next <= frame || next > t->stackBase)
+                        break;
+                    key[k] = Load<uint32_t>(next - 8);
+                    frame = next;
+                }
+                std::lock_guard lock(g_yieldSitesMutex);
+                g_sleepSites[key] += took;
+            }
         }
     }
     ctx.r3.u64 = STATUS_SUCCESS;

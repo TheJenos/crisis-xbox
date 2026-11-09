@@ -11,6 +11,7 @@
 /recomp/runtime/stubs.gen.cpp
 !/recomp/web-src/
 !/recomp/config/
+/recomp/config/*.before-*
 !/recomp/overlay-template/
 !/recomp/build_web.sh
 !/recomp/build_web_variant.sh

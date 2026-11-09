@@ -1445,3 +1445,33 @@ index 31a86cd..1d236df 100644
  #   error "Missing implementation for __rdtsc()"
  #endif
  
+diff --git a/thirdparty/disasm/ppc-dis.c b/thirdparty/disasm/ppc-dis.c
+index 3e224b4..6e9bc2c 100644
+--- a/thirdparty/disasm/ppc-dis.c
++++ b/thirdparty/disasm/ppc-dis.c
+@@ -5519,6 +5519,12 @@ again:
+             || (opcode->flags & dialect) == 0)
+             continue;
+ 
++        /* Xenon has no PPC403/405/440-only instructions. "cell" adds the 403
++           dialect, so e.g. mullhwu. (405/440) shadowed vsldoi128 (opcode 4,
++           0x13C0F311 at 0x8296D2A0 in Crysis 2): skip such entries. */
++        if ((opcode->flags & ~(PPC_OPCODE_403 | PPC_OPCODE_440)) == 0)
++            continue;
++
+         /* Make two passes over the operands.  First see if any of them
+        have extraction functions, and, if they do, make sure the
+        instruction is valid.  */
+@@ -5694,6 +5700,12 @@ again:
+             || (opcode->flags & dialect) == 0)
+             continue;
+ 
++        /* Xenon has no PPC403/405/440-only instructions. "cell" adds the 403
++           dialect, so e.g. mullhwu. (405/440) shadowed vsldoi128 (opcode 4,
++           0x13C0F311 at 0x8296D2A0 in Crysis 2): skip such entries. */
++        if ((opcode->flags & ~(PPC_OPCODE_403 | PPC_OPCODE_440)) == 0)
++            continue;
++
+         /* Make two passes over the operands.  First see if any of them
+        have extraction functions, and, if they do, make sure the
+        instruction is valid.  */

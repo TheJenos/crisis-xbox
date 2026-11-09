@@ -89,6 +89,16 @@
   @media (orientation: portrait) { body.touch.running #rotate { display: flex; } }
   body.touch #log { height: 20vh; }
   body.touch #disc { top: auto; right: auto; bottom: 8px; left: 50%; transform: translateX(-50%); }
+
+  /* Crash notice */
+  #crash { position: absolute; inset: 0; z-index: 7; display: none; align-items: center; justify-content: center;
+    background: rgba(11,13,12,.88); padding: 16px; }
+  #crash.shown { display: flex; }
+  #crash .why { color: var(--warn); font: 12px/1.4 ui-monospace, monospace; margin: 0 0 16px; word-break: break-word; }
+  #crash .buttons { display: flex; gap: 10px; flex-wrap: wrap; }
+  #crash button { background: #1d2321; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px;
+    font: inherit; cursor: pointer; }
+  #crash button.primary { background: var(--accent-dim); border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -143,6 +153,17 @@
     </div>
   </div>
   <div id="rotate">Turn your device sideways to play.</div>
+  <div id="crash" role="alertdialog" aria-labelledby="crash-title">
+    <div class="card">
+      <h1 id="crash-title">The game crashed</h1>
+      <p>Reload to continue from your last checkpoint. The crash report helps find the cause.</p>
+      <div class="why" id="crash-why"></div>
+      <div class="buttons">
+        <button class="primary" id="crash-reload" type="button">Reload</button>
+        <button id="crash-report" type="button">Save crash report</button>
+      </div>
+    </div>
+  </div>
 </div>
 <div id="bar">
   <span id="status">Loading…</span>
@@ -218,6 +239,46 @@
     const e = $('error'); e.style.display = 'block'; e.textContent = message;
     status.textContent = message;
   }
+
+  // ---- Crash notice ------------------------------------------------------
+  // An error in a game thread (such as a bad memory access in the game's code)
+  // stops the game for good. Say so, offer a reload (saved games are kept),
+  // and a report: the log, which includes the crashed thread's full stack
+  // (pre.js sends it). crysis.report() saves one at any time.
+  let runtimeStarted = false, crashReason = '';
+  function crashReport() {
+    const env = new URLSearchParams(location.search).getAll('env');
+    return ['Crysis 2 (recompiled) crash report',
+      'Time: ' + new Date().toISOString(),
+      'Options: ' + (env.length ? env.join(' ') : 'none'),
+      'Browser: ' + navigator.userAgent,
+      'Error: ' + (crashReason || 'none'),
+      '', ...(window.allLog || []).slice(-4000)].join('\n');
+  }
+  function saveCrashReport() {
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([crashReport()], { type: 'text/plain' }));
+    a.download = 'crysis2-crash-' + stamp + '.txt';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  }
+  function showCrash(reason) {
+    if (crashReason) return;
+    crashReason = reason;
+    log('[crash] ' + reason);
+    $('crash-why').textContent = reason;
+    $('crash').classList.add('shown');
+    document.body.classList.remove('running'); // no more mouse hint
+    if (document.pointerLockElement) document.exitPointerLock();
+  }
+  $('crash-reload').onclick = () => location.reload();
+  $('crash-report').onclick = saveCrashReport;
+  crysis.report = saveCrashReport;
+  window.addEventListener('error', (e) => {
+    const text = String((e.error && e.error.message) || e.message || '').replace(/^Uncaught /, '');
+    if (runtimeStarted && /RuntimeError|Aborted|out of bounds|unreachable|stack overflow|recursion/i.test(text)) showCrash(text);
+  });
 
   if (!crossOriginIsolated) fail('This page needs cross-origin isolation. Serve it with recomp/serve.py.');
   if (!navigator.gpu) fail('This browser has no WebGPU. Use a recent Chrome or Edge (desktop or Android).');
@@ -359,7 +420,9 @@
       }).catch((e) => fail(String(e && e.message || e)));
       return {};
     },
+    onAbort: (what) => showCrash('Aborted: ' + what),
     onRuntimeInitialized: () => {
+      runtimeStarted = true;
       discTimer = setInterval(pollDisc, 500);
       watchFirstFrame();
       if (window.crysisControls) crysisControls.onRuntime(); // mouse settings (controls.js)

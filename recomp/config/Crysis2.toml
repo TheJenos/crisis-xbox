@@ -115,4 +115,8 @@ functions = [
     { address = 0x830A3F28, size = 0x24 }, # reached only through function pointers
     { address = 0x830F0A18, size = 0x8 }, # reached only through function pointers
     { address = 0x835AA050, size = 0x440 }, # reached only through function pointers
+    # memset: its last two byte stores (0x8347C7E0 stb r4,1(r6); bdzlr and
+    # 0x8347C7E8 stb r4,2(r6); blr) were split off as separate functions, so the
+    # recompiled memset fell off its end and left 1-2 trailing bytes unwritten.
+    { address = 0x8347C750, size = 0xA0 },
 ]

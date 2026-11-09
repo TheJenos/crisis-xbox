@@ -59,6 +59,7 @@ NAMEFLAGS="--profiling-funcs"
     -sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE='$UTF8ToString' \
     -sEXPORTED_FUNCTIONS=_main,_crysis_touch_buttons,_crysis_touch_axis,_crysis_disc_bytes,_crysis_disc_busy,_crysis_dump_threads,_crysis_peek32,_crysis_dump_frame,_crysis_shader_wgsl,_crysis_log_consts,_crysis_skip_ps,_crysis_mouse_move,_crysis_mouse_config,_crysis_watch_const,_crysis_watch_value,_crysis_control,_crysis_saves_writing,_crysis_saves_changes,_crysis_debug_save,_crysis_checkpoint_failures \
     --embed-file overlay-template/system.cfg@/overlay/system.cfg \
+    --pre-js web-src/pre.js \
     -o web/crysis2.js
 # Page, key bindings / settings, saved games, and the service worker that caches disc reads.
 cp web-src/index.html web-src/controls.js web-src/saves.js web-src/sw.js web/

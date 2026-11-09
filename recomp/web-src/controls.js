@@ -124,10 +124,15 @@
   const locked = () => document.pointerLockElement === canvas();
   function capturePointer() {
     const c = canvas();
+    // The browser refuses a capture right after Esc released it (about a
+    // second); that's not an error worth reporting, the next click works.
+    const plain = () => {
+      try { const p = c.requestPointerLock(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+    };
     try {
       const p = c.requestPointerLock({ unadjustedMovement: true }); // raw movement, no OS acceleration
-      if (p && p.catch) p.catch(() => { try { c.requestPointerLock(); } catch (e) {} });
-    } catch (e) { try { c.requestPointerLock(); } catch (e2) {} }
+      if (p && p.catch) p.catch((e) => { if (!e || e.name !== 'SecurityError') plain(); });
+    } catch (e) { plain(); }
   }
 
   document.addEventListener('keydown', (e) => {
