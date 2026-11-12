@@ -516,6 +516,9 @@ uint64_t PPCTimeBase()
 {
     if (prof::Enabled())
         prof::timebaseReads.fetch_add(1, std::memory_order_relaxed);
+    // (Cached readings for threads polling the clock, as gta4-web does, gave
+    // nothing here: 64.1 vs 64.8 fps uncapped at the pier, 2026-11-12. The
+    // polling loops wait for time to pass; cheaper reads only spin faster.)
     uint64_t ns = PlatformCounterNs();
     return (ns / 1000000000ull) * 50000000ull + (ns % 1000000000ull) / 20ull;
 }

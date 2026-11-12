@@ -32,16 +32,62 @@
 // ---------------------------------------------------------------------------
 bool PlatformReserveGuest(uint8_t** base)
 {
+    // Linear memory above the heap's end has never been handed out and reads
+    // as zero. Clearing all 2 GB by hand made every page of it real memory at
+    // startup, whether the title ever used it or not (gta4-web found the same:
+    // its tab took 14 GB). Only the part below the old end, which the
+    // allocator may have used before, is cleared.
+    const uintptr_t oldEnd = uintptr_t(sbrk(0));
     void* window = aligned_alloc(0x10000, GUEST_HIGH - GUEST_LOW);
     if (!window)
         return false;
-    memset(window, 0, GUEST_HIGH - GUEST_LOW);
+    const uintptr_t start = uintptr_t(window), end = start + (GUEST_HIGH - GUEST_LOW);
+    static const bool clearAll = getenv("GUEST_CLEAR_ALL") != nullptr; // (the old way, for comparisons)
+    if (clearAll)
+        memset(window, 0, GUEST_HIGH - GUEST_LOW);
+    else if (start < oldEnd)
+        memset(window, 0, std::min(end, oldEnd) - start);
+    Log("platform: guest memory at %08X, %s", uint32_t(start),
+        clearAll ? "cleared in full" : start < oldEnd ? "cleared below the old heap end" : "fresh (not cleared)");
     *base = (uint8_t*)(uintptr_t(window) - GUEST_LOW); // wraps modulo 2^32
     return true;
 }
 
 bool PlatformCommit(uint8_t*, size_t) { return true; }      // linear memory is always accessible
-void PlatformDecommit(uint8_t* p, size_t n) { memset(p, 0, n); }
+
+// Decommitted ranges must read as zero again, but a written page of linear
+// memory stays committed for good: only pages that aren't zero already are
+// cleared. The title decommits ranges it never touched, which a plain memset
+// turned into real memory. (Reading an untouched page costs nothing where the
+// system maps a shared zero page: Linux, Android, ChromeOS, macOS.)
+void PlatformDecommit(uint8_t* p, size_t n)
+{
+    static const bool clearAll = getenv("GUEST_CLEAR_ALL") != nullptr; // (the old way, for comparisons)
+    if (clearAll)
+    {
+        memset(p, 0, n);
+        return;
+    }
+    constexpr size_t kPage = 4096;
+    for (size_t at = 0; at < n;)
+    {
+        size_t pageEnd = std::min(n, size_t(((uintptr_t(p + at) | (kPage - 1)) + 1) - uintptr_t(p)));
+        const uint8_t* q = p + at;
+        size_t len = pageEnd - at, i = 0;
+        bool zero = true;
+        for (; zero && i + 8 <= len; i += 8)
+        {
+            uint64_t w;
+            memcpy(&w, q + i, 8);
+            zero = w == 0;
+        }
+        for (; zero && i < len; i++)
+            zero = q[i] == 0;
+        if (!zero)
+            memset(p + at, 0, len);
+        at = pageEnd;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Threads and time

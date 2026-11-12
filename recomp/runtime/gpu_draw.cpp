@@ -1457,6 +1457,9 @@ void RecordDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize,
             Log("render: %u shader constants changed outside the command stream; reading all constants for every draw from now on", differ);
         }
     }
+    // (Comparing only the constants each draw's shaders read, as gta4-web does,
+    // saved no uploads here: measured 2026-11-12, ~740 blocks a frame either
+    // way. Crysis 2 changes constants the next draw reads.)
     if (firstOfFrame || (g_constDirty && !EqualSwap32(g_constUploaded, g_constMirror, 2048, 0)))
     {
         g_lastConstantOffset = AppendUniform(g_constMirror, sizeof(g_constMirror));

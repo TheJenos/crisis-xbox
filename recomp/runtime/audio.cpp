@@ -298,6 +298,13 @@ namespace
 // once (at most every 50 us; the polling thread still covers idle contexts).
 void XmaPump()
 {
+    // Only every 8th poll of a thread reads the clock: each read is a call out
+    // to JavaScript (performance.now), and at ~270k polls a second those reads
+    // were a third of the sound threads' time. (Polls come every few
+    // microseconds, so the 50 us spacing still holds.)
+    thread_local uint32_t polls = 0;
+    if ((++polls & 7) != 0)
+        return;
     static std::atomic<uint64_t> last{ 0 };
     uint64_t now = PlatformCounterNs(), prev = last.load(std::memory_order_relaxed);
     if (now - prev < 50000 || !last.compare_exchange_strong(prev, now))
