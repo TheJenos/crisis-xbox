@@ -53,7 +53,8 @@ namespace render
             std::map<std::vector<uint8_t>, std::pair<WGPUBindGroupLayout, WGPUPipelineLayout>> textureLayouts;
 
             struct Tex { WGPUTexture texture = nullptr; WGPUTextureView view = nullptr, depthView = nullptr; uint32_t w = 0, h = 0, layers = 1, mips = 1; WGPUTextureFormat format{};
-                         uint32_t depth = 1; bool is3d = false; }; // is3d: a 3D texture of `depth` slices
+                         uint32_t depth = 1; bool is3d = false; // is3d: a 3D texture of `depth` slices
+                         uint32_t nw = 0, nh = 0; };            // render targets: guest size in samples (w, h: host size, see TargetScale)
             std::unordered_map<uint32_t, Tex> textures;   // uploads and resolve destinations, by id
             struct RtKeyHash { size_t operator()(const RtKey& k) const { return k.base * 131 + k.pitch * 7 + k.format; } };
             std::unordered_map<RtKey, Tex, RtKeyHash> targets;
@@ -347,17 +348,41 @@ fn to7e3(v: f32) -> f32 {
     let p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
     return vec4f(p[i], 0.0, 1.0);
 }
+fn load(p: vec2i, size: vec2i) -> vec4f {
+    return textureLoad(src, clamp(p, vec2i(0), size - 1), 0);
+}
 @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     let s = params.offset.zw;
     let c = (vec2i(pos.xy) + params.offset.xy) * s;
     let size = vec2i(textureDimensions(src));
-    var sum = vec4f(0.0);
-    for (var y = 0; y < s.y; y++) {
-        for (var x = 0; x < s.x; x++) {
-            sum += textureLoad(src, clamp(c + vec2i(x, y), vec2i(0), size - 1), 0);
+    var v = vec4f(0.0);
+    if (params.mode.z == 65536 && params.mode.w == 65536) {
+        var sum = vec4f(0.0);
+        for (var y = 0; y < s.y; y++) {
+            for (var x = 0; x < s.x; x++) {
+                sum += load(c + vec2i(x, y), size);
+            }
+        }
+        v = sum / f32(s.x * s.y);
+    } else {
+        // A target rendered at a reduced size (render::TargetScale), or a
+        // destination stored at one: the destination texel's area in source
+        // samples (guest units), read at its centre in the source's texels.
+        // Depth and integers take the nearest texel; colours are filtered
+        // between the four nearest.
+        let k = f32(params.mode.z) / 65536.0;
+        let g = pos.xy / (f32(params.mode.w) / 65536.0); // guest destination position
+        let centre = (g + vec2f(params.offset.xy)) * vec2f(s) * k;
+        if (params.mode.x != 0) {
+            v = load(vec2i(floor(centre)), size); // (filtering would invent depths and integers)
+        } else {
+            let p = centre - 0.5;
+            let i = vec2i(floor(p));
+            let f = p - floor(p);
+            v = mix(mix(load(i, size), load(i + vec2i(1, 0), size), f.x),
+                    mix(load(i + vec2i(0, 1), size), load(i + vec2i(1, 1), size), f.x), f.y);
         }
     }
-    var v = sum / f32(s.x * s.y);
     // No NaN or infinity reaches later passes; 7e3 surfaces hold [0, 31.875].
     v = select(clamp(v, vec4f(-65504.0), vec4f(65504.0)), vec4f(0.0), v != v);
     if (params.mode.y == 1) {
@@ -540,6 +565,17 @@ fn to7e3(v: f32) -> f32 {
             fs.entryPoint = Str("main");
             fs.targetCount = targetCount;
             fs.targets = targets;
+            // Fixed-function state the pixel shader folds in (xenos_wgsl.cpp overrides).
+            WGPUConstantEntry constants[3] = {};
+            const char* constantNames[3] = { "XE_ALPHA_FUNC", "XE_ALPHA_MASK", "XE_PGEN" };
+            const double constantValues[3] = { double(k.alphaFunc), double(k.alphaToMask), k.pgenReg == 0xFF ? -1.0 : double(k.pgenReg) };
+            for (int i = 0; i < 3; i++)
+            {
+                constants[i].key = Str(constantNames[i]);
+                constants[i].value = constantValues[i];
+            }
+            fs.constantCount = 3;
+            fs.constants = constants;
 
             WGPUDepthStencilState ds = WGPU_DEPTH_STENCIL_STATE_INIT;
             ds.format = WGPUTextureFormat_Depth24PlusStencil8;
@@ -576,7 +612,7 @@ fn to7e3(v: f32) -> f32 {
             pd.primitive.stripIndexFormat = k.stripIndexed ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Undefined;
             pd.primitive.frontFace = k.frontCW ? WGPUFrontFace_CW : WGPUFrontFace_CCW;
             pd.primitive.cullMode = k.cull == 1 ? WGPUCullMode_Front : k.cull == 2 ? WGPUCullMode_Back : WGPUCullMode_None;
-            pd.depthStencil = &ds;
+            pd.depthStencil = k.noDepthAttachment ? nullptr : &ds;
             pd.fragment = &fs;
 #ifdef __EMSCRIPTEN__
             // Compile asynchronously. A synchronous createRenderPipeline makes the
@@ -632,17 +668,23 @@ fn to7e3(v: f32) -> f32 {
             return bucket.back().pipeline && bucket.back().status->load() != 2 ? &bucket.back() : nullptr;
         }
 
-        // Render target texture for a surface, at the shared height for its pitch.
+        // Host size of `n` guest samples in a target scaled by s (never smaller
+        // than the scaled area, so a scaled viewport always fits).
+        uint32_t HostSize(uint32_t n, float s) { return s == 1.0f ? n : std::max(1u, uint32_t(std::ceil(double(n) * s))); }
+
+        // Render target texture for a surface, at the shared height for its pitch
+        // (both in samples), scaled by TargetScale.
         Backend::Tex& Target(const RtKey& k, uint32_t height)
         {
             uint32_t& ph = g.pitchHeight[k.pitch];
             ph = std::max(ph, height);
             Backend::Tex& t = g.targets[k];
-            if (!t.texture || t.h != ph || t.w != k.pitch)
+            if (!t.texture || t.nh != ph || t.nw != k.pitch)
             {
                 ReleaseTex(t);
+                float s = TargetScale(k.pitch);
                 t.format = HostFormat(k.format);
-                t.texture = MakeTexture(k.pitch, ph, 1, t.format,
+                t.texture = MakeTexture(HostSize(k.pitch, s), HostSize(ph, s), 1, t.format,
                                         WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc);
                 t.view = wgpuTextureCreateView(t.texture, nullptr);
                 if (k.format == RT_DEPTH24S8)
@@ -652,8 +694,10 @@ fn to7e3(v: f32) -> f32 {
                     vd.aspect = WGPUTextureAspect_DepthOnly;
                     t.depthView = wgpuTextureCreateView(t.texture, &vd);
                 }
-                t.w = k.pitch;
-                t.h = ph;
+                t.w = HostSize(k.pitch, s);
+                t.h = HostSize(ph, s);
+                t.nw = k.pitch;
+                t.nh = ph;
             }
             return t;
         }
@@ -689,7 +733,9 @@ fn to7e3(v: f32) -> f32 {
             WGPURenderPassEncoder pass = nullptr;
             RtKey color[4];
             RtKey depth;
-            uint32_t height = 0;
+            uint32_t height = 0;             // guest height of the targets (samples)
+            float scale = 1.0f;              // TargetScale of the targets
+            uint32_t hostW = 0, hostH = 0;   // their host size
             bool indexBound = false;
             // Last state sent in this pass (stateValid false: nothing sent yet).
             bool stateValid = false;
@@ -699,12 +745,56 @@ fn to7e3(v: f32) -> f32 {
             uint32_t constOffset = 0, miscOffset = 0, stencilRef = 0;
             uint32_t scissor[4] = {};
             float blend[4] = {};
+            bool usesDepth = false; // a draw in this pass tests or writes depth/stencil
+            bool noDepth = false;   // the pass has no depth attachment
         };
+
+        // Which draws can go in a pass without a depth buffer: runs of draws to
+        // the same targets (between resolves) in which no draw tests or writes
+        // depth or stencil (post-processing, mostly). Phone GPUs load and store
+        // every attachment of every pass, so a full-size depth buffer each time
+        // cost them memory traffic for nothing. Indexed like f.cmds.
+        std::vector<uint8_t> DepthlessRuns(const Frame& f)
+        {
+            std::vector<uint8_t> out(f.cmds.size(), 0);
+            size_t start = 0;
+            bool open = false, uses = false;
+            const DrawCmd* first = nullptr;
+            auto close = [&](size_t end) {
+                if (open && !uses)
+                    for (size_t j = start; j < end; j++)
+                        if (f.cmds[j].type == Cmd::Draw) out[j] = 1;
+                open = false;
+            };
+            for (size_t i = 0; i < f.cmds.size(); i++)
+            {
+                if (f.cmds[i].type != Cmd::Draw) { close(i); continue; }
+                const DrawCmd& d = f.draws[f.cmds[i].index];
+                bool same = open && first->depth == d.depth;
+                for (int k = 0; k < 4 && same; k++)
+                    same = first->color[k] == d.color[k];
+                if (!same)
+                {
+                    close(i);
+                    open = true; uses = false; start = i; first = &d;
+                }
+                if (d.pipe.depthTest || d.pipe.depthWrite || d.pipe.stencilEnable)
+                    uses = true;
+            }
+            close(f.cmds.size());
+            return out;
+        }
+
+        // Render passes per frame (phone GPUs pay for each pass and for loading
+        // and storing its targets): logged with the backend timing.
+        struct PassCounts { uint64_t draw = 0, drawNoDepth = 0, resolve = 0, resolveFull = 0, clear = 0; } g_passCounts;
 
         void EndPass(PassState& ps)
         {
             if (ps.pass)
             {
+                g_passCounts.draw++;
+                if (!ps.usesDepth) g_passCounts.drawNoDepth++;
                 wgpuRenderPassEncoderEnd(ps.pass);
                 wgpuRenderPassEncoderRelease(ps.pass);
                 ps.pass = nullptr;
@@ -1087,6 +1177,10 @@ fn to7e3(v: f32) -> f32 {
                     params[i * 64 + 3] = std::max<int32_t>(1, f.resolves[i].scaleY);
                     params[i * 64 + 4] = f.resolves[i].convert;
                     params[i * 64 + 5] = f.resolves[i].clamp7e3;
+                    // The source's host texels per sample and the destination's per
+                    // texel, in 1/65536 (targets rendered at a reduced size).
+                    params[i * 64 + 6] = int32_t(std::lround(TargetScale(f.resolves[i].src.pitch) * 65536.0f));
+                    params[i * 64 + 7] = int32_t(std::lround(f.resolves[i].destScale * 65536.0f));
                     memcpy(&params[i * 64 + 8], f.resolves[i].mul, 16);
                     memcpy(&params[i * 64 + 12], f.resolves[i].maxv, 16);
                 }
@@ -1100,15 +1194,22 @@ fn to7e3(v: f32) -> f32 {
             std::vector<Writeback> writebacks;
             g_gpuProf.BeginFrame();
 
+            const std::vector<uint8_t> depthless = DepthlessRuns(f);
             for (const Cmd& c : f.cmds)
             {
                 if (c.type == Cmd::Draw)
                 {
                     const DrawCmd& d = f.draws[c.index];
-                    const Backend::Pipe* pipe = Pipeline(d.pipe);
+                    bool hasColor = false;
+                    for (int i = 0; i < 4; i++)
+                        hasColor |= d.color[i].Valid();
+                    bool noDepth = hasColor && depthless[size_t(&c - f.cmds.data())] != 0; // (a pass needs some attachment)
+                    PipelineKey key = d.pipe;
+                    key.noDepthAttachment = noDepth;
+                    const Backend::Pipe* pipe = Pipeline(key);
                     if (!pipe)
                         continue;
-                    bool same = ps.pass && ps.depth == d.depth && ps.height >= d.rtHeight && !g_gpuProf.active;
+                    bool same = ps.pass && ps.depth == d.depth && ps.noDepth == noDepth && ps.height >= d.rtHeight && !g_gpuProf.active;
                     for (int i = 0; i < 4 && same; i++)
                         same = ps.color[i] == d.color[i];
                     if (!same)
@@ -1145,17 +1246,24 @@ fn to7e3(v: f32) -> f32 {
                         {
                             char label[96];
                             snprintf(label, sizeof(label), "draw ps %08X vs %08X target %ux%u%s", uint32_t(d.pipe.ps), uint32_t(d.pipe.vs),
-                                     depth.w, std::min(d.rtHeight, depth.h), d.pipe.rectList ? " rect" : "");
+                                     depth.nw, std::min(d.rtHeight, depth.nh), d.pipe.rectList ? " rect" : "");
                             rp.timestampWrites = g_gpuProf.Stamp(label);
                         }
-                        rp.depthStencilAttachment = &da;
+                        rp.depthStencilAttachment = noDepth ? nullptr : &da;
                         ps.pass = wgpuCommandEncoderBeginRenderPass(enc, &rp);
                         for (int i = 0; i < 4; i++) ps.color[i] = d.color[i];
                         ps.depth = d.depth;
-                        ps.height = depth.h;
+                        ps.noDepth = noDepth;
+                        ps.height = depth.nh;
+                        ps.scale = TargetScale(d.depth.pitch);
+                        ps.hostW = depth.w;
+                        ps.hostH = depth.h;
                         ps.indexBound = false;
                         ps.stateValid = false; // a new pass starts with default state
+                        ps.usesDepth = false;
                     }
+                    if (d.pipe.depthTest || d.pipe.depthWrite || d.pipe.stencilEnable)
+                        ps.usesDepth = true;
 
                     // Textures (group 1), from the cache when this exact set was bound before.
                     WGPUBindGroup bg1 = g.emptyBg;
@@ -1220,6 +1328,19 @@ fn to7e3(v: f32) -> f32 {
                         continue;
                     // Viewport per draw: the draw's transform spans d.rtHeight rows.
                     float vw = float(d.depth.pitch), vh = float(std::min(d.rtHeight, ps.height));
+                    if (ps.scale != 1.0f)
+                    {
+                        // Scaled target: the same area in host texels. The scissor
+                        // grows to whole texels (it never vanishes).
+                        vw = std::min(vw * ps.scale, float(ps.hostW));
+                        vh = std::min(vh * ps.scale, float(ps.hostH));
+                        uint32_t x0 = uint32_t(std::floor(sx * ps.scale)), y0 = uint32_t(std::floor(sy * ps.scale));
+                        uint32_t x1 = std::min(ps.hostW, uint32_t(std::ceil((sx + sw) * ps.scale)));
+                        uint32_t y1 = std::min(ps.hostH, uint32_t(std::ceil((sy + sh) * ps.scale)));
+                        if (x1 <= x0 || y1 <= y0)
+                            continue;
+                        sx = x0, sy = y0, sw = x1 - x0, sh = y1 - y0;
+                    }
                     if (!ps.stateValid || ps.vw != vw || ps.vh != vh)
                     {
                         wgpuRenderPassEncoderSetViewport(ps.pass, 0, 0, vw, vh, 0.0f, 1.0f);
@@ -1284,14 +1405,18 @@ fn to7e3(v: f32) -> f32 {
                         bool depth = r.src.format == RT_DEPTH24S8;
                         int blit = depth && g.float32Filterable ? 2 : r.destFloat || depth || r.convert == 1 ? 1 : 0;
                         WGPUTextureFormat df = blit == 2 ? WGPUTextureFormat_R32Float : blit ? WGPUTextureFormat_RGBA16Float : WGPUTextureFormat_RGBA8Unorm;
-                        if (!dst.texture || dst.w != r.destW || dst.h != r.destH || dst.format != df)
+                        // (A copy of a scaled target is stored scaled: destScale.)
+                        uint32_t dw = HostSize(r.destW, r.destScale), dh = HostSize(r.destH, r.destScale);
+                        if (!dst.texture || dst.w != dw || dst.h != dh || dst.nw != r.destW || dst.nh != r.destH || dst.format != df)
                         {
                             ReleaseTex(dst);
                             dst.format = df;
-                            dst.texture = MakeTexture(r.destW, r.destH, 1, df, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc);
+                            dst.texture = MakeTexture(dw, dh, 1, df, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc);
                             dst.view = wgpuTextureCreateView(dst.texture, nullptr);
-                            dst.w = r.destW;
-                            dst.h = r.destH;
+                            dst.w = dw;
+                            dst.h = dh;
+                            dst.nw = r.destW;
+                            dst.nh = r.destH;
                         }
                         // (ReleaseTex above may have cleared the cache; look up after it.)
                         WGPUTextureView srcView = src.depthView ? src.depthView : src.view;
@@ -1313,14 +1438,22 @@ fn to7e3(v: f32) -> f32 {
                         }
                         else
                             g.groupsReused++;
+                        uint32_t w = std::min<uint32_t>(uint32_t(r.w), r.destW), h = std::min<uint32_t>(uint32_t(r.h), r.destH);
+                        // A copy over the whole texture starts from a clear, not a load:
+                        // free on phone GPUs, where loading means reading it from memory.
+                        bool whole = w == r.destW && h == r.destH;
+                        // The area written, in the destination's texels.
+                        uint32_t hw = std::min(dst.w, HostSize(w, r.destScale)), hh = std::min(dst.h, HostSize(h, r.destScale));
                         WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
                         ca.view = dst.view;
-                        ca.loadOp = WGPULoadOp_Load;
+                        ca.loadOp = whole ? WGPULoadOp_Clear : WGPULoadOp_Load;
+                        ca.clearValue = { 0, 0, 0, 0 };
                         ca.storeOp = WGPUStoreOp_Store;
                         WGPURenderPassDescriptor rp = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
                         rp.colorAttachmentCount = 1;
                         rp.colorAttachments = &ca;
-                        uint32_t w = std::min<uint32_t>(uint32_t(r.w), r.destW), h = std::min<uint32_t>(uint32_t(r.h), r.destH);
+                        g_passCounts.resolve++;
+                        if (whole) g_passCounts.resolveFull++;
                         if (g_gpuProf.active)
                         {
                             char label[96];
@@ -1333,7 +1466,7 @@ fn to7e3(v: f32) -> f32 {
                             wgpuRenderPassEncoderSetPipeline(pass, g.blitPipeline[blit]);
                             uint32_t off = c.index * 256;
                             wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 1, &off);
-                            wgpuRenderPassEncoderSetScissorRect(pass, 0, 0, w, h);
+                            wgpuRenderPassEncoderSetScissorRect(pass, 0, 0, hw, hh);
                             wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
                         }
                         wgpuRenderPassEncoderEnd(pass);
@@ -1418,6 +1551,7 @@ fn to7e3(v: f32) -> f32 {
                                         Target(r.clearColor, r.rtHeight).w == Target(r.clearDepth, r.rtHeight).w;
                         if (g_gpuProf.active)
                             rp.timestampWrites = g_gpuProf.Stamp("clear");
+                        g_passCounts.clear += sameSize ? 1 : 2;
                         if (sameSize)
                         {
                             WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(enc, &rp);
@@ -1487,6 +1621,9 @@ fn to7e3(v: f32) -> f32 {
                     g_execTiming.encode / n, g_execTiming.submit / n, g_execTiming.draws / n,
                     (g.groupsCreated - g_execTiming.groupsCreated) / n, (g.groupsReused - g_execTiming.groupsReused) / n,
                     latAvg, latMax);
+                Log("render: passes per frame: %.1f draw (%.1f without depth/stencil use), %.1f resolve (%.1f overwrite the whole texture), %.1f clear",
+                    g_passCounts.draw / n, g_passCounts.drawNoDepth / n, g_passCounts.resolve / n, g_passCounts.resolveFull / n, g_passCounts.clear / n);
+                g_passCounts = {};
                 g_execTiming = {};
                 g_execTiming.groupsCreated = g.groupsCreated;
                 g_execTiming.groupsReused = g.groupsReused;
@@ -1516,6 +1653,22 @@ fn to7e3(v: f32) -> f32 {
                     (unsigned long long)g.drawsExecuted);
             }
         }
+    }
+
+    float TargetScale(uint32_t pitch)
+    {
+        // (In 1/16 steps: exact in float, so scaled sizes and viewports agree.)
+        static const float scale = [] {
+            const char* v = getenv("RES_SCALE");
+            float s = v ? std::clamp(float(atof(v)), 0.25f, 1.0f) : 1.0f;
+            s = std::round(s * 16.0f) / 16.0f;
+            if (s != 1.0f)
+                Log("render: internal resolution %.0f%% (render targets from %s samples wide)", s * 100.0f,
+                    getenv("RES_SCALE_MIN_PITCH") ? getenv("RES_SCALE_MIN_PITCH") : "1024");
+            return s;
+        }();
+        static const uint32_t minPitch = getenv("RES_SCALE_MIN_PITCH") ? uint32_t(atoi(getenv("RES_SCALE_MIN_PITCH"))) : 1024;
+        return pitch >= minPitch ? scale : 1.0f;
     }
 
     void SubmitFrame(std::unique_ptr<Frame> frame)
@@ -1554,14 +1707,26 @@ fn to7e3(v: f32) -> f32 {
         Log("render: WebGPU backend ready");
     }
 
+    // The front buffer's area in its texture's texels (a front buffer copied
+    // from a target rendered at a reduced size is stored at that size).
+    static void PresentSize(const Backend::Tex& t, uint32_t& w, uint32_t& h)
+    {
+        w = g.presentW ? g.presentW : t.w;
+        h = g.presentH ? g.presentH : t.h;
+        if (t.nw && t.nh && (t.nw != t.w || t.nh != t.h))
+        {
+            w = std::min(t.w, uint32_t(std::lround(double(w) * t.w / t.nw)));
+            h = std::min(t.h, uint32_t(std::lround(double(h) * t.h / t.nh)));
+        }
+    }
+
     WGPUTexture BackendPresentTexture(uint32_t& w, uint32_t& h, bool& isFloat, uint64_t& frames)
     {
         frames = g.frames;
         auto it = g.textures.find(g.presentId);
         if (!g.presentId || it == g.textures.end())
             return nullptr;
-        w = g.presentW ? g.presentW : it->second.w;
-        h = g.presentH ? g.presentH : it->second.h;
+        PresentSize(it->second, w, h);
         isFloat = it->second.format == WGPUTextureFormat_RGBA16Float;
         return it->second.texture;
     }
@@ -1608,8 +1773,7 @@ fn to7e3(v: f32) -> f32 {
         auto it = g.textures.find(g.presentId);
         if (it == g.textures.end() || !it->second.view)
             return nullptr;
-        showW = g.presentW ? g.presentW : it->second.w;
-        showH = g.presentH ? g.presentH : it->second.h;
+        PresentSize(it->second, showW, showH);
         texW = it->second.w;
         texH = it->second.h;
         return it->second.view;

@@ -20,6 +20,10 @@
 
 #include <image.h> // XenonUtils: XEX decryption/decompression
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 extern std::unordered_map<size_t, const char*> XboxKernelExports;
 extern std::unordered_map<size_t, const char*> XamExports;
 
@@ -76,6 +80,47 @@ uint32_t XexHeaderField(uint32_t key)
         return (k & 0xFF) <= 1 ? v : h + v;
     }
     return 0;
+}
+
+// The title's icon (its dashboard tile) for the page's loading screen, which
+// keeps it for the next visit (index.html Module.onTitleIcon). It is a PNG in
+// the title's XDBF resource (listed in the RESOURCE_INFO header, loaded with
+// the image): namespace 2 (images), id 0x8000.
+static void PublishTitleIcon()
+{
+#ifdef __EMSCRIPTEN__
+    uint32_t info = XexHeaderField(0x000002FF); // { u32 size; { char name[8]; u32 address, size; }... }
+    if (!info)
+        return;
+    uint32_t count = (Load<uint32_t>(info) - 4) / 16;
+    for (uint32_t i = 0; i < count && i < 64; i++)
+    {
+        uint32_t entry = info + 4 + i * 16, xdbf = Load<uint32_t>(entry + 8), size = Load<uint32_t>(entry + 12);
+        if (size < 24 || Load<uint32_t>(xdbf) != 0x58444246) // "XDBF"
+            continue;
+        // Header: magic, version, entry table length, entry count, free table length, free count.
+        uint32_t tableLength = Load<uint32_t>(xdbf + 8), entries = Load<uint32_t>(xdbf + 12), freeLength = Load<uint32_t>(xdbf + 16);
+        for (uint32_t j = 0; j < entries && j < tableLength; j++)
+        {
+            uint32_t e = xdbf + 24 + j * 18; // { u16 namespace; u64 id; u32 offset, length; }
+            if (Load<uint16_t>(e) != 2 || Load<uint64_t>(e + 2) != 0x8000)
+                continue;
+            // Data follows the tables (sized by their lengths; XenonUtils sizes the
+            // entry table by the entry count instead, so accept either).
+            uint32_t offset = Load<uint32_t>(e + 10), length = Load<uint32_t>(e + 14);
+            for (uint32_t tables : { tableLength * 18 + freeLength * 8, entries * 18 + freeLength * 8 })
+            {
+                uint32_t png = xdbf + 24 + tables + offset;
+                if (length < 8 || uint64_t(png) + length > uint64_t(xdbf) + size || Load<uint32_t>(png) != 0x89504E47) // PNG signature
+                    continue;
+                MAIN_THREAD_EM_ASM({ if (Module.onTitleIcon) Module.onTitleIcon(new Uint8Array(wasmMemory.buffer, $0, $1).slice()); },
+                                   GuestPtr(png), length);
+                return;
+            }
+            return;
+        }
+    }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +394,7 @@ int main(int argc, char** argv)
         g_xex.titleId = Load<uint32_t>(exec + 12);
     Log("title %08X, stack %X, TLS: %u slots, data %08X (%X bytes, %X raw)", g_xex.titleId, g_xex.stackSize,
         g_xex.tlsSlots, g_xex.tlsRawData, g_xex.tlsDataSize, g_xex.tlsRawDataSize);
+    PublishTitleIcon();
 
     ResolveVariableImports(file, image);
     StartTimeStampThread();

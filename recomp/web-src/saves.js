@@ -171,6 +171,26 @@
     updateTotals([]); state.lastSaved = 0;
   }
 
+  // Settings: delete the checkpoint (and the earlier copy kept with it), or
+  // everything stored (checkpoints and the profile with its settings and
+  // campaign progress). The running game has read its saves already, so the
+  // page reloads; nothing more is stored before that.
+  async function deleteStored(onlyCheckpoints) {
+    frozen = true;
+    try {
+      await transact('readwrite', (s, prev) => {
+        for (const st of [s, prev]) {
+          if (!onlyCheckpoints) { st.clear(); continue; }
+          st.openCursor().onsuccess = (e) => {
+            const c = e.target.result;
+            if (c) { if (isCheckpoint(c.key)) c.delete(); c.continue(); }
+          };
+        }
+      }, [STORE, PREVIOUS]);
+    } catch (e) { frozen = false; throw e; }
+    location.reload();
+  }
+
   // ---- A checkpoint the game can't load ---------------------------------------
   // The newest stored checkpoint and the one it replaced: { path, saved } or null.
   async function checkpoints() {
@@ -269,6 +289,8 @@
     info: () => ({ ...state }),
     flush: () => sync(true),
     clear,
+    deleteCheckpoint: () => deleteStored(true), // then reloads
+    deleteAll: () => deleteStored(false),       // then reloads
     checkpoints,      // { current, previous }: the stored checkpoints
     showLoadFailure,  // the dialog shown when the game can't load a checkpoint
   };

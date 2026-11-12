@@ -5,6 +5,8 @@
 #include "guest.h"
 
 #include <windows.h>
+#include <algorithm>
+#pragma comment(lib, "Synchronization.lib") // WaitOnAddress
 
 // ---------------------------------------------------------------------------
 // Guest address space: one reservation for 0x40000000-0xBFFFFFFF, committed on demand.
@@ -68,6 +70,11 @@ void PlatformUploadDump(const char* name, const void* data, size_t size)
     }
 }
 void PlatformYield() { ::SwitchToThread(); }
+void PlatformWaitWord(volatile uint32_t* p, uint32_t expected, double ms)
+{
+    ::WaitOnAddress(p, &expected, sizeof(expected), DWORD(std::max(1.0, ms)));
+}
+void PlatformWakeWord(volatile uint32_t* p) { ::WakeByAddressAll((void*)p); }
 
 uint64_t PlatformCounterNs()
 {

@@ -15,6 +15,8 @@
 #include <emscripten/threading.h>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <climits>
 #include <cmath>
 #include <vector>
 #include <dirent.h>
@@ -109,14 +111,33 @@ namespace
 
     void* SleepTimerThread(void*)
     {
+        // How long before a deadline the coarse wait has to end: the longest
+        // recent overshoot of a coarse wait plus 1 ms. It starts at a whole tick
+        // and shrinks by 2% a wait unless a wait overshoots more (on this
+        // PC's browser a 1 ms wait takes ~5 ms): spinning only that stretch,
+        // not the last 17 ms before every deadline, frees most of a core.
+        double window = kTickMs;
+        // SLEEP_WINDOW=<ms>: a fixed window instead (comparisons).
+        static const double fixedWindow = getenv("SLEEP_WINDOW") ? atof(getenv("SLEEP_WINDOW")) : 0.0;
+        if (fixedWindow > 0) window = fixedWindow;
+        // (PROFILE: how late the wakes are, from this thread's side.)
+        double statsFrom = emscripten_get_now(), lateSum = 0, lateMax = 0;
+        uint32_t wakes = 0;
         for (;;)
         {
             double now = emscripten_get_now(), next = INFINITY;
+            if (prof::Enabled() && now - statsFrom > 10000)
+            {
+                Log("PROFILE sleep timer: %.0f wakes/s, late %.2f ms on average (at most %.1f), spin window %.1f ms",
+                    wakes * 1000.0 / (now - statsFrom), wakes ? lateSum / wakes : 0.0, lateMax, window);
+                statsFrom = now, lateSum = lateMax = 0, wakes = 0;
+            }
             pthread_mutex_lock(&g_sleepMutex);
             for (size_t i = 0; i < g_sleepers.size();)
             {
                 if (g_sleepers[i].deadline <= now)
                 {
+                    wakes++, lateSum += now - g_sleepers[i].deadline, lateMax = std::max(lateMax, now - g_sleepers[i].deadline);
                     g_sleepers[i].word->store(1);
                     emscripten_futex_wake(g_sleepers[i].word, 1);
                     g_sleepers[i] = g_sleepers.back();
@@ -129,8 +150,18 @@ namespace
             pthread_mutex_unlock(&g_sleepMutex);
             if (next == INFINITY)
                 emscripten_futex_wait(&g_sleepersChanged, changed, INFINITY); // until someone sleeps
-            else if (next - now > kTickMs)
-                emscripten_futex_wait(&g_sleepersChanged, changed, next - now - kTickMs); // coarse; a new sleeper wakes it
+            else if (next - now > window + 1.0)
+            {
+                // Coarse (a new sleeper wakes it). Waits shorter than 1 ms are
+                // not used: some browsers stretch those to a whole tick.
+                double ask = next - now - window;
+                int r = emscripten_futex_wait(&g_sleepersChanged, changed, ask);
+                if (r == -ETIMEDOUT && fixedWindow <= 0)
+                {
+                    double over = emscripten_get_now() - now - ask;
+                    window = std::clamp(std::max(over + 1.0, window * 0.98), 2.0, double(kTickMs));
+                }
+            }
             else
                 while (emscripten_get_now() < next && g_sleepersChanged.load(std::memory_order_relaxed) == changed)
                     ; // the last stretch against the clock (or a new, maybe earlier, deadline)
@@ -146,6 +177,48 @@ namespace
         pthread_create(&t, &attr, SleepTimerThread, nullptr);
         pthread_attr_destroy(&attr);
     }
+
+    // How short sleeps are done, decided once from how long a 1 ms wait takes:
+    // - Wait: the browser times short waits well (Android, macOS, Linux), so a
+    //   sleep is just a timed wait and nothing spins. Phones have few fast cores,
+    //   and spinning threads there slowed the ones doing the work.
+    // - Timer: waits end on a coarse tick (browsers on Windows): the timer
+    //   thread above.
+    // - Spin: each sleeper spins on the clock (the old way, for comparisons).
+    // PRECISE_SLEEP=wait|timer|spin forces one.
+    enum class SleepMode { Wait, Timer, Spin };
+    bool g_yieldWaits = false; // zero-length sleeps wait 50 us instead of spinning (set with the mode)
+    SleepMode DecideSleepMode()
+    {
+        const char* v = getenv("PRECISE_SLEEP");
+        if (v && !strcmp(v, "spin")) return SleepMode::Spin;
+        if (v && !strcmp(v, "timer")) return SleepMode::Timer;
+        if (v && !strcmp(v, "wait")) return g_yieldWaits = true, SleepMode::Wait;
+        static std::atomic<uint32_t> never{ 0 };
+        auto shortest = [](double ms) {
+            double best = INFINITY;
+            for (int i = 0; i < 3; i++)
+            {
+                double t0 = emscripten_get_now();
+                emscripten_futex_wait(&never, 0, ms);
+                best = std::min(best, emscripten_get_now() - t0);
+            }
+            return best;
+        };
+        double one = shortest(1.0), tenth = shortest(0.1);
+        bool precise = one < 4.0;
+        g_yieldWaits = precise && tenth < 0.5; // (only if even very short waits end on time)
+        Log("platform: a 1 ms wait takes %.2f ms, a 0.1 ms wait %.2f ms: %s%s", one, tenth,
+            precise ? "sleeps are timed waits" : "a timer thread ends short sleeps against the clock",
+            g_yieldWaits ? ", yields wait 50 us" : "");
+        return precise ? SleepMode::Wait : SleepMode::Timer;
+    }
+    SleepMode Mode()
+    {
+        static const SleepMode mode = DecideSleepMode();
+        return mode;
+    }
+    thread_local std::atomic<uint32_t> t_idle{ 0 }; // never signalled: a timed wait's word
 }
 
 void PlatformSleepMsPrecise(uint32_t ms)
@@ -153,11 +226,15 @@ void PlatformSleepMsPrecise(uint32_t ms)
     if (ms == 0)
         return;
     double target = emscripten_get_now() + double(ms);
+    if (Mode() == SleepMode::Wait)
+    {
+        for (double left = ms; left > 0; left = target - emscripten_get_now())
+            emscripten_futex_wait(&t_idle, 0, left);
+        return;
+    }
     if (ms > kTickMs)
         usleep(useconds_t(ms - kTickMs) * 1000);
-    // PRECISE_SLEEP=spin: every sleeper spins on the clock itself (the old way; for comparisons).
-    static const bool spin = [] { const char* v = getenv("PRECISE_SLEEP"); return v && strcmp(v, "spin") == 0; }();
-    if (spin)
+    if (Mode() == SleepMode::Spin)
     {
         while (emscripten_get_now() < target)
             ;
@@ -185,17 +262,30 @@ void PlatformSleepMsPrecise(uint32_t ms)
         emscripten_futex_wait(&word, 0, std::max(left, 0.0) + 20.0); // the timer thread's wake, or a safety timeout
     }
 }
-void PlatformYield() { sched_yield(); }
+// The title's zero-length sleeps (spin-wait loops). sched_yield does nothing in
+// WebAssembly, so such a loop keeps a core busy; where short waits are timed
+// well, each yield waits 50 microseconds instead and leaves the core to others.
+void PlatformYield()
+{
+    if (Mode() == SleepMode::Wait && g_yieldWaits)
+        emscripten_futex_wait(&t_idle, 0, 0.05);
+    else
+        sched_yield();
+}
+
+void PlatformWaitWord(volatile uint32_t* p, uint32_t expected, double ms) { emscripten_futex_wait(p, expected, ms); }
+void PlatformWakeWord(volatile uint32_t* p) { emscripten_futex_wake(p, INT_MAX); }
 
 // The browser's monotonic clock counts from 1970 (performance.timeOrigin), so
 // the guest's 50 MHz time base would read like a console that has been on for
 // decades, and the title's 64-bit tick arithmetic (ticks * 100000 / frequency)
 // overflows. Count from startup instead, plus a minute, like a fresh boot.
+// (emscripten_get_now directly: the title reads its clock hundreds of
+// thousands of times a second, and clock_gettime adds the WASI layer and a
+// BigInt conversion to each read. Same clock: timeOrigin + performance.now().)
 static uint64_t RawMonotonicNs()
 {
-    timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+    return uint64_t(emscripten_get_now() * 1e6);
 }
 
 uint64_t PlatformCounterNs()

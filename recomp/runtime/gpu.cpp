@@ -16,6 +16,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -528,7 +529,24 @@ namespace
                 if (CompareFunc(info, v & mask, ref))
                 {
                     if (!first && prof::Enabled())
-                        prof::cpWaitNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+                    {
+                        uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+                        prof::cpWaitNs += ns;
+                        // Which waits: (memory or register, address, function) -> time, count.
+                        static std::map<uint64_t, std::pair<uint64_t, uint64_t>> sites;
+                        static auto lastLog = std::chrono::steady_clock::now();
+                        auto& s = sites[(uint64_t(info & 0x17) << 32) | addr];
+                        s.first += ns, s.second++;
+                        if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(10))
+                        {
+                            lastLog = std::chrono::steady_clock::now();
+                            for (auto& [k, t] : sites)
+                                if (t.first > 50000000)
+                                    Log("PROFILE GPU waits: %s %08X func %u: %.0f ms in %llu waits (10 s)", (k >> 36) & 1 ? "memory" : "register",
+                                        uint32_t(k), uint32_t(k >> 32) & 7, t.first / 1e6, (unsigned long long)t.second);
+                            sites.clear();
+                        }
+                    }
                     break;
                 }
                 if (!warned && std::chrono::steady_clock::now() - start > std::chrono::seconds(2))
@@ -655,8 +673,12 @@ namespace
     void CommandProcessorThread(PPCContext&)
     {
         uint32_t idle = 0;
+        volatile uint32_t* wptrWord = (volatile uint32_t*)GuestPtr(REG_BASE + CP_RB_WPTR * 4);
         for (;;)
         {
+            // (Read before the check: a kick-off after this changes the word,
+            // so the wait below returns at once instead of missing it.)
+            uint32_t wptrRaw = *wptrWord;
             {
                 std::lock_guard lock(g_ringMutex);
                 uint32_t ring = g_ringBase, size = g_ringSizeDwords;
@@ -681,9 +703,12 @@ namespace
                     continue;
                 }
             }
-            // Spin briefly for low latency, then back off.
-            if (++idle < 1000) PlatformYield();
-            else PlatformSleepMs(1);
+            // Idle: wait for the title to move the ring's write pointer. Its
+            // kick-off wakes this (GpuKickedOff); the timeout covers any other
+            // writer. (This used to spin, then sleep 1 ms, which browsers on
+            // Windows stretch to 5-15 ms: new commands waited that long.)
+            if (++idle < 64) PlatformYield();
+            else PlatformWaitWord(wptrWord, wptrRaw, 2.0);
         }
     }
 
@@ -745,6 +770,13 @@ namespace
         Store<uint32_t>(m + 28, 0x4A); // pixel clock in MHz (74.25 for 720p); titles divide the GPU clock by it
         Store<uint32_t>(m + 32, 1);
     }
+}
+
+// The title moved the ring buffer's write pointer (D3D's kick-off, hooked in
+// hooks.cpp): wake the command processor if it waits for work.
+void GpuKickedOff()
+{
+    PlatformWakeWord((volatile uint32_t*)GuestPtr(REG_BASE + CP_RB_WPTR * 4));
 }
 
 // ---------------------------------------------------------------------------

@@ -57,7 +57,7 @@ NAMEFLAGS="--profiling-funcs"
     -sSTACK_SIZE=8MB -sDEFAULT_PTHREAD_STACK_SIZE=2MB \
     -sENVIRONMENT=web,worker -sEXIT_RUNTIME=0 \
     -sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE='$UTF8ToString' \
-    -sEXPORTED_FUNCTIONS=_main,_crysis_touch_buttons,_crysis_touch_axis,_crysis_disc_bytes,_crysis_disc_busy,_crysis_dump_threads,_crysis_peek32,_crysis_dump_frame,_crysis_shader_wgsl,_crysis_log_consts,_crysis_skip_ps,_crysis_mouse_move,_crysis_mouse_config,_crysis_watch_const,_crysis_watch_value,_crysis_control,_crysis_saves_writing,_crysis_saves_changes,_crysis_debug_save,_crysis_checkpoint_failures \
+    -sEXPORTED_FUNCTIONS=_main,_crysis_touch_buttons,_crysis_touch_axis,_crysis_disc_bytes,_crysis_disc_busy,_crysis_dump_threads,_crysis_peek32,_crysis_dump_frame,_crysis_shader_wgsl,_crysis_log_consts,_crysis_skip_ps,_crysis_mouse_move,_crysis_mouse_config,_crysis_watch_const,_crysis_watch_value,_crysis_control,_crysis_saves_writing,_crysis_saves_changes,_crysis_debug_save,_crysis_checkpoint_failures,_crysis_prompt_buttons \
     --embed-file overlay-template/system.cfg@/overlay/system.cfg \
     --pre-js web-src/pre.js \
     -o web/crysis2.js

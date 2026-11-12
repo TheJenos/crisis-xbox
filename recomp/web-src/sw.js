@@ -1,11 +1,18 @@
-// Service worker: keeps the disc data the game reads in this browser.
+// Service worker: keeps the disc data the game reads in this browser, and makes
+// the page work from a plain static file server.
 //
 // The game reads disc files with synchronous ranged GETs from its worker
 // threads (/disc/<file>, "Range: bytes=a-b"). Each read is answered from 1 MB
 // chunks held in Cache Storage; missing chunks are fetched from the server
 // once and stored, so the next visit reads them locally. Everything else
-// (the page, crysis2.js, size checks) goes to the network as usual; the page
-// caches crysis2.wasm itself.
+// (the page, crysis2.js, size checks) goes to the network; the page caches
+// crysis2.wasm itself.
+//
+// Browsers allow the game's threads (SharedArrayBuffer) only on a cross-origin
+// isolated page, which takes two response headers (COOP and COEP). serve.py
+// sends them; a static host may not, so every same-origin response passing
+// through here gets them (and .wasm its MIME type). On its first visit the page
+// registers this worker and reloads once, so it is itself served through here.
 const DISC_CACHE = 'crysis-disc-v1';
 const CHUNK = 1 << 20;
 const MEMORY_CHUNKS = 64; // most recently used chunks also kept in memory (small reads repeat a lot)
@@ -105,18 +112,33 @@ async function readRange(path, header) {
   });
 }
 
+// The response with the cross-origin isolation headers added.
+function isolated(response, url) {
+  if (!response || response.type === 'opaque' || response.status === 0) return response;
+  const headers = new Headers(response.headers);
+  headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+  headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
+  headers.set('Cross-Origin-Resource-Policy', 'same-origin');
+  if (url.pathname.endsWith('.wasm')) headers.set('Content-Type', 'application/wasm'); // (for compiling while downloading)
+  const empty = response.status === 204 || response.status === 304 || !response.body;
+  return new Response(empty ? null : response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
 self.addEventListener('fetch', (event) => {
   const req = event.request;
-  if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  if (url.origin !== self.location.origin || !url.pathname.startsWith('/disc/')) return;
+  if (url.origin !== self.location.origin) return;
   const range = req.headers.get('Range');
-  if (!range) return;
-  event.respondWith(readRange(url.pathname, range).catch((e) => {
-    stats.errors++;
-    console.warn('disc cache:', e);
-    return fetch(req); // fall back to the server
-  }));
+  if (req.method === 'GET' && range && url.pathname.startsWith('/disc/')) {
+    event.respondWith(readRange(url.pathname, range).catch((e) => {
+      stats.errors++;
+      console.warn('disc cache:', e);
+      return fetch(req).then((r) => isolated(r, url)); // fall back to the server
+    }));
+    return;
+  }
+  if (req.method !== 'GET' && req.method !== 'HEAD') return;
+  event.respondWith(fetch(req).then((r) => isolated(r, url)));
 });
 
 self.addEventListener('message', (e) => {

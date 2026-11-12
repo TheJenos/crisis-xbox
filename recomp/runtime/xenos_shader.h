@@ -178,5 +178,9 @@ namespace xenos
         // Resolved textures are sized by the copy's destination pitch (e.g.
         // 32x8), which can exceed the size the fetch constant gives (e.g. 1x1).
         float texcoordScale[32][2];
+        // Per fetch slot: host texels per guest texel (resolved textures of
+        // targets rendered at a reduced size, render::TargetScale), for
+        // unnormalized coordinates.
+        float texelScale[32];
     };
 }

@@ -683,7 +683,7 @@ index d08371e..0e6d139 100644
                              ReadTable(image, table);
                              printTable(table);
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..351522f 100644
+index fa91527..d6ef78c 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -265,11 +265,20 @@ bool Recompiler::Recompile(
@@ -1122,17 +1122,48 @@ index fa91527..351522f 100644
          default:
              println("\t__builtin_debugtrap();");
              break;
-@@ -2381,6 +2658,10 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2381,6 +2658,12 @@ bool Recompiler::Recompile(const Function& fn)
          name = fmt::format("sub_{}", fn.base);
      }
  
 +    // The register save/restore helpers operate on the context: they are only
 +    // called from ctx-mode functions once the *_as_local options are on.
 +    ctxMode = config.ctxFunctions.count(fn.base) != 0 ||name.find("__save") == 0 || name.find("__rest") == 0;
++    if (!config.localFunctions.empty() && config.localFunctions.count(fn.base) == 0)
++        ctxMode = true;
 +
  #ifdef XENON_RECOMP_USE_ALIAS
      println("__attribute__((alias(\"__imp__{}\"))) PPC_WEAK_FUNC({});", name, name);
  #endif
+@@ -2512,19 +2795,22 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+ 
+         if (config.skipLr)
+             println("#define PPC_CONFIG_SKIP_LR");      
+-        if (config.ctrAsLocalVariable)
++        // With a local_functions list, most functions keep every register in
++        // ctx: the runtime must not assume the *_as_local layout globally.
++        const bool globalLocals = config.localFunctions.empty();
++        if (config.ctrAsLocalVariable && globalLocals)
+             println("#define PPC_CONFIG_CTR_AS_LOCAL");      
+-        if (config.xerAsLocalVariable)
++        if (config.xerAsLocalVariable && globalLocals)
+             println("#define PPC_CONFIG_XER_AS_LOCAL");      
+-        if (config.reservedRegisterAsLocalVariable)
++        if (config.reservedRegisterAsLocalVariable && globalLocals)
+             println("#define PPC_CONFIG_RESERVED_AS_LOCAL");      
+         if (config.skipMsr)
+             println("#define PPC_CONFIG_SKIP_MSR");      
+-        if (config.crRegistersAsLocalVariables)
++        if (config.crRegistersAsLocalVariables && globalLocals)
+             println("#define PPC_CONFIG_CR_AS_LOCAL");      
+-        if (config.nonArgumentRegistersAsLocalVariables)
++        if (config.nonArgumentRegistersAsLocalVariables && globalLocals)
+             println("#define PPC_CONFIG_NON_ARGUMENT_AS_LOCAL");   
+-        if (config.nonVolatileRegistersAsLocalVariables)
++        if (config.nonVolatileRegistersAsLocalVariables && globalLocals)
+             println("#define PPC_CONFIG_NON_VOLATILE_AS_LOCAL");
+ 
+         println("");
 diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
 index 8242db5..8416563 100644
 --- a/XenonRecomp/recompiler.h
@@ -1146,10 +1177,10 @@ index 8242db5..8416563 100644
      bool LoadConfig(const std::string_view& configFilePath);
  
 diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
-index 81330a4..ea28d15 100644
+index 81330a4..1f2dec7 100644
 --- a/XenonRecomp/recompiler_config.cpp
 +++ b/XenonRecomp/recompiler_config.cpp
-@@ -58,6 +58,12 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+@@ -58,6 +58,18 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
              }
          }
  
@@ -1159,14 +1190,20 @@ index 81330a4..ea28d15 100644
 +                ctxFunctions.emplace(*addr.value<uint32_t>());
 +        }
 +
++        if (auto localArray = main["local_functions"].as_array())
++        {
++            for (auto& addr : *localArray)
++                localFunctions.emplace(*addr.value<uint32_t>());
++        }
++
          if (auto invalidArray = main["invalid_instructions"].as_array())
          {
              for (auto& instr : *invalidArray)
 diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
-index 534e503..a1a4767 100644
+index 534e503..7ac0500 100644
 --- a/XenonRecomp/recompiler_config.h
 +++ b/XenonRecomp/recompiler_config.h
-@@ -50,6 +50,12 @@ struct RecompilerConfig
+@@ -50,6 +50,16 @@ struct RecompilerConfig
      uint32_t longJmpAddress = 0;
      uint32_t setJmpAddress = 0;
      std::unordered_map<uint32_t, uint32_t> functions;
@@ -1176,6 +1213,10 @@ index 534e503..a1a4767 100644
 +    // tails split off by the analysis, setjmp callers). Calls between two of them
 +    // pass registers through ctx as before.
 +    std::unordered_set<uint32_t> ctxFunctions;
++    // If not empty, only these functions use the *_as_local options; every other
++    // function keeps all registers in ctx, as with the options off. For trying
++    // locals on a few hot leaf functions, checked one by one.
++    std::unordered_set<uint32_t> localFunctions;
      std::unordered_map<uint32_t, uint32_t> invalidInstructions;
      std::unordered_map<uint32_t, RecompilerMidAsmHook> midAsmHooks;
  

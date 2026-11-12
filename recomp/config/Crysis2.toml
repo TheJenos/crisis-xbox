@@ -6,15 +6,21 @@ file_path = "../../extracted/default.xex"
 out_directory_path = "../ppc"
 switch_table_file_path = "Crysis2_switch_tables.toml"
 
-# Optimizations stay off until a recompilation runs correctly.
+# Registers as C++ locals: only for the functions in local_functions (needs the
+# patched XenonRecomp, analysis/XenonRecomp-crysis2.patch); every other function
+# keeps all registers in ctx. Locals for the whole program changed shadows
+# (2026-11-09 side session), so each function here is checked on its own.
 skip_lr = false
 skip_msr = false
-ctr_as_local = false
-xer_as_local = false
-reserved_as_local = false
-cr_as_local = false
-non_argument_as_local = false
-non_volatile_as_local = false
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+non_argument_as_local = true
+non_volatile_as_local = true
+# 0x82A2FC40: the main thread's coverage-buffer occlusion test (a fifth of its
+# time at the pier), a leaf with a SIMD loop: 20% -> 17%, picture unchanged.
+local_functions = [ 0x82A2FC40 ]
 
 # Register save/restore helpers, found by the byte signatures in XenonRecomp's README
 # (each matched exactly once in .text).

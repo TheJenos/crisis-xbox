@@ -571,7 +571,7 @@ namespace xenos
                     {
                         coord = dim == 0 ? "vec2f(tc.x, 0.5)" : "tc.xy";
                         if (f.unnormalizedCoords)
-                            coord = Fmt("(%s / vec2f(textureDimensions(tex%u)))", coord.c_str(), k);
+                            coord = Fmt("(%s * M.tsz[%u][%u] / vec2f(textureDimensions(tex%u)))", coord.c_str(), k / 4, k % 4, k);
                         else // fetch size / host size (resolved textures can be larger)
                             coord = Fmt("(%s * M.tcs[%u].%s)", coord.c_str(), k / 2, (k & 1) ? "zw" : "xy");
                     }
@@ -833,7 +833,7 @@ namespace xenos
                 m += "struct FloatConstants { c: array<vec4f, 512>, }\n";
                 m += "struct Misc {\n    bools: array<vec4u, 2>,\n    loops: array<vec4u, 8>,\n    vbase: array<vec4u, 24>,\n"
                      "    pos_scale: vec4f,\n    pos_offset: vec4f,\n    alpha_ref: vec4f,\n    swz: array<vec4u, 8>,\n    tscale: array<vec4f, 32>,\n    pgen: vec4f,\n"
-                     "    tcs: array<vec4f, 16>,\n}\n";
+                     "    tcs: array<vec4f, 16>,\n    tsz: array<vec4f, 8>,\n}\n";
                 m += "@group(0) @binding(0) var<uniform> C: FloatConstants;\n";
                 m += "@group(0) @binding(1) var<uniform> M: Misc;\n";
                 if (!pixel)
@@ -970,8 +970,18 @@ namespace xenos
                 }
                 else
                 {
+                    // Fixed-function state as pipeline constants (render_wgpu.cpp), so
+                    // the compiled shader keeps only what the draw uses. Phone GPUs
+                    // in particular: a discard anywhere in a shader stops them from
+                    // rejecting hidden or stenciled pixels before shading, and a
+                    // register array written at a run-time index lives in memory.
+                    m += "override XE_ALPHA_FUNC: u32 = 7u;  // alpha test compare function, 7 = always\n"
+                         "override XE_ALPHA_MASK: bool = false; // alpha to coverage\n"
+                         "override XE_PGEN: i32 = -1;         // register for the pixel position, -1 = none\n\n";
+                    // Only the interpolators the shader reads (inputs are copied to
+                    // its first registers); the vertex stage writes all of them.
                     m += "struct PsIn {\n    @invariant @builtin(position) frag_coord: vec4f,\n";
-                    for (uint32_t i = 0; i < kInterpolators; i++)
+                    for (uint32_t i = 0; i < std::min(regCount, kInterpolators); i++)
                         m += Fmt("    @location(%u) i%u: vec4f,\n", i, i);
                     m += "}\n\n";
                     bool hasOut = t.colorTargetMask || t.writesDepth;
@@ -991,15 +1001,16 @@ namespace xenos
                     m += "    odepth = vec4f(input.frag_coord.z);\n";
                     // Pixel position (param gen): XY = position (D3D centers at integers),
                     // reported as front facing (positive X; facing would need another inter-stage slot).
-                    m += Fmt("    if (M.pgen.x >= 0.0) {\n"
-                             "        let pos = input.frag_coord.xy - vec2f(M.pgen.y);\n"
-                             "        r[min(u32(M.pgen.x), %uu)] = vec4f(pos, 0.0, 0.0);\n"
+                    m += Fmt("    if (XE_PGEN >= 0) {\n"
+                             "        let pos = input.frag_coord.xy * M.pgen.w - vec2f(M.pgen.y);\n"
+                             "        r[min(u32(XE_PGEN), %uu)] = vec4f(pos, 0.0, 0.0);\n"
                              "    }\n", regCount - 1);
                     m += "    run();\n";
                     m += "    _ = C.c[0];\n";
-                    // Alpha test (fixed function on Xenos): alpha_ref = (reference, compare function; 7 = always).
+                    m += "    _ = XE_ALPHA_FUNC;\n    _ = XE_ALPHA_MASK;\n"; // (the pipeline always sets them)
+                    // Alpha test (fixed function on Xenos): reference M.alpha_ref.x, compare function XE_ALPHA_FUNC.
                     if (t.colorTargetMask & 1)
-                        m += "    let af = u32(M.alpha_ref.y);\n"
+                        m += "    let af = XE_ALPHA_FUNC;\n"
                              "    if (af != 7u) {\n"
                              "        let a = oc[0].w;\n"
                              "        let ar = M.alpha_ref.x;\n"
@@ -1008,7 +1019,7 @@ namespace xenos
                              "        if (!ok) { discard; }\n"
                              "    }\n"
                              // Alpha to mask without MSAA: an ordered 2x2 dither of coverage.
-                             "    if (M.alpha_ref.w != 0.0) {\n"
+                             "    if (XE_ALPHA_MASK) {\n"
                              "        let q = vec2u(input.frag_coord.xy) & vec2u(1u);\n"
                              "        let thresholds = array<f32, 4>(0.125, 0.625, 0.875, 0.375);\n"
                              "        if (oc[0].w < thresholds[q.y * 2u + q.x]) { discard; }\n"

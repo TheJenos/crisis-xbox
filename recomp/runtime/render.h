@@ -30,7 +30,7 @@ namespace render
     template <class T> using PodVector = std::vector<T, NoInitAllocator<T>>;
 
     constexpr uint32_t kConstBytes = 8192;   // 512 float4 constants (VS 0-255, PS 256-511)
-    constexpr uint32_t kMiscBytes = 1504;     // xenos::MiscConstants as laid out in the WGSL
+    constexpr uint32_t kMiscBytes = 1632;     // xenos::MiscConstants as laid out in the WGSL
     constexpr uint32_t kUniformAlign = 256;  // dynamic uniform offset alignment
     constexpr uint8_t kNone = 0xFF;
 
@@ -64,6 +64,13 @@ namespace render
         uint8_t depthTest, depthWrite, depthFunc;    // Xenos compare function
         uint8_t stencilEnable, stencilReadMask, stencilWriteMask;
         uint8_t rectList;        // vertex entry point main_rect: 6 vertices per Xenos rectangle
+        // Pixel shader pipeline constants (xenos_wgsl.cpp overrides), so the
+        // compiled shader has only the code the draw uses: no discard without an
+        // alpha test, and a fixed register for the pixel position.
+        uint8_t alphaFunc;       // alpha test compare function, 7 = always (no test)
+        uint8_t alphaToMask;     // alpha to coverage (dithered)
+        uint8_t pgenReg;         // register receiving the pixel position, 0xFF = none
+        uint8_t noDepthAttachment; // set by the backend only: drawn in a pass without a depth buffer (no draw in it uses one)
         uint32_t stencilOps;     // front func/fail/zpass/zfail, back func/fail/zpass/zfail (3 bits each)
         uint32_t blend[4];       // raw RB_BLENDCONTROL
     };
@@ -97,6 +104,7 @@ namespace render
         uint32_t rtHeight;
         int32_t x, y, w, h;             // source rectangle
         uint32_t destId, destW, destH;  // destination texture (backend-side, sampled by later draws)
+        float destScale = 1.0f;         // its host texels per guest texel (TargetScale of a scaled source)
         bool destFloat;                 // RGBA16F destination (else RGBA8)
         uint8_t scaleX, scaleY;         // MSAA source: samples per pixel in x and y (averaged)
         uint8_t convert;                // 0 copy, 1 fixed point (integers: round(value * mul), clamped to maxv), 2 depth
@@ -162,4 +170,11 @@ namespace render
     // Hand a finished frame to the backend. Thread-safe; blocks while too many
     // frames are queued so the guest can't run arbitrarily far ahead.
     void SubmitFrame(std::unique_ptr<Frame> frame);
+
+    // Internal resolution scale: host texels per EDRAM sample for a render
+    // target of this pitch (samples). RES_SCALE=0.5-1 (default 1) applies to
+    // targets at least RES_SCALE_MIN_PITCH samples wide (default 1024: the
+    // full-resolution chain; shadow maps, half-resolution and smaller passes
+    // keep their size). Resolve destinations always have the guest's size.
+    float TargetScale(uint32_t pitch);
 }

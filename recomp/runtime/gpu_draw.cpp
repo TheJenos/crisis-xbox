@@ -89,6 +89,18 @@ namespace
         return h;
     }
 
+    // Sparse fingerprint of a large block: 64 pieces of 16 bytes spread over
+    // it. Catches a block replaced as a whole (new content at the same
+    // address) at a fraction of a full hash.
+    uint64_t SampleHash(const void* data, size_t n)
+    {
+        const uint8_t* p = (const uint8_t*)data;
+        uint64_t h = 1469598103934665603ull;
+        for (size_t s = 0; s < 64; s++)
+            h = Hash64(p + (((n - 16) * s / 63) & ~size_t(15)), 16, h);
+        return h;
+    }
+
     // Bulk endian conversion and comparison of guest data (vertex buffers,
     // indices, constants), 16 bytes at a time with WebAssembly SIMD. The
     // per-dword loops took most of the command processor's time.
@@ -253,7 +265,14 @@ namespace
     std::unordered_set<uint64_t> g_sentShaders;
     uint32_t g_nextTextureId = 1;
 
-    struct CachedTexture { uint32_t id; uint64_t hash; uint64_t checkedFrame; uint64_t lastUsed; size_t bytes; };
+    // stableChecks: full hashes in a row that found the texels unchanged.
+    // changes: times the texels changed after the first upload (streaming
+    // fills a texture in a few steps; a movie changes every frame).
+    struct CachedTexture
+    {
+        uint32_t id; uint64_t hash; uint64_t sample; uint64_t checkedFrame; uint64_t lastUsed; size_t bytes;
+        uint32_t stableChecks; uint32_t changes;
+    };
     std::unordered_map<uint64_t, CachedTexture> g_textures; // by texture description
     size_t g_textureBytes = 0; // decoded texels held by the backend for g_textures
 
@@ -264,7 +283,7 @@ namespace
     uint64_t SurfaceKey(uint32_t base, uint32_t pitch) { return uint64_t(base) | (uint64_t(pitch) << 16); }
     uint32_t XenosColorFormat(uint32_t index) { return (Reg(index == 0 ? RB_COLOR_INFO : RB_COLOR1_INFO + index - 1) >> 16) & 0xF; }
 
-    struct Resolved { uint32_t id, w, h; bool isFloat; bool swapRB; float chanMax[4]; bool rawInt; bool raw7e3 = false; };
+    struct Resolved { uint32_t id, w, h; bool isFloat; bool swapRB; float chanMax[4]; bool rawInt; bool raw7e3 = false; float scale = 1.0f; };
     std::unordered_map<uint32_t, Resolved> g_resolved; // by guest address
 
     // Shader constants (ALU constant registers 0x4000-0x47FF) as draws see
@@ -549,11 +568,35 @@ namespace
         if (c.id && c.checkedFrame == g_stats.frames)
             return c.id;
         size_t bytes = TextureByteSize(t);
-        uint64_t h = bytes ? Hash64(GuestPtr(t.address), bytes) : 0;
-        Count(prof::CPC_TEX_HASH_BYTES, bytes);
         c.checkedFrame = g_stats.frames;
+        // Hashing every used texture every frame was a tenth of the command
+        // processor's time. A large texture that has stayed unchanged for 60
+        // checks is fully hashed only every 4th frame (staggered by key); the
+        // frames between compare a sparse fingerprint, which still catches a
+        // texture replaced as a whole. One that changed after its first upload
+        // (streamed in steps) needs 600 unchanged checks first; one that
+        // changed more than 3 times (a movie) is fully hashed every frame.
+        constexpr size_t kSampledMin = 32 << 10;
+        const uint8_t* texels = (const uint8_t*)GuestPtr(t.address);
+        bool sampled = bytes >= kSampledMin;
+        if (c.id && sampled && c.changes <= 3 && c.stableChecks >= (c.changes ? 600u : 60u) &&
+            ((g_stats.frames + (key >> 40)) & 3) != 0)
+        {
+            Count(prof::CPC_TEX_HASH_BYTES, 1024);
+            if (SampleHash(texels, bytes) == c.sample)
+                return c.id;
+        }
+        uint64_t h = bytes ? Hash64(texels, bytes) : 0;
+        Count(prof::CPC_TEX_HASH_BYTES, bytes);
         if (c.id && c.hash == h)
+        {
+            c.stableChecks++;
             return c.id;
+        }
+        if (c.id)
+            c.changes++;
+        c.stableChecks = 0;
+        c.sample = sampled ? SampleHash(texels, bytes) : 0;
         render::TextureUpload up;
         if (DecodesToHalf(t.format))
         {
@@ -958,6 +1001,10 @@ namespace
                 rc.wbDepth = srcSelect == 4;
                 rc.wbHalf2 = half2;
             }
+            // A copy of a target rendered at a reduced size stays that size
+            // (fewer texels to write and read), unless the CPU reads it.
+            rc.destScale = rc.wbAddr ? 1.0f : render::TargetScale(rc.src.pitch);
+            r.scale = rc.destScale;
         }
         if (clearColor)
         {
@@ -1258,6 +1305,7 @@ void RecordDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize,
     for (uint32_t& s : misc.textureSwizzle) s = kIdentitySwizzle;
     for (auto& sc : misc.textureScale) sc[0] = sc[1] = sc[2] = sc[3] = 1.0f;
     for (auto& ts : misc.texcoordScale) ts[0] = ts[1] = 1.0f;
+    for (float& s : misc.texelScale) s = 1.0f;
     for (int i = 0; i < 8; i++) misc.bools[i] = Reg(BOOL_CONSTANTS + i);
     for (int i = 0; i < 32; i++) misc.loops[i] = Reg(LOOP_CONSTANTS + i);
     CheckRunawayLoops(shaders.vsHash, shaders.vs, misc.bools, misc.loops);
@@ -1275,8 +1323,16 @@ void RecordDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize,
     // SQ_PROGRAM_CNTL.param_gen (bit 18): the pixel position goes to the
     // interpolator register SQ_CONTEXT_MISC.param_gen_pos (bits 8-15).
     misc.paramGen[0] = (Reg(0x2180) >> 18) & 1 ? float((Reg(0x2181) >> 8) & 0xFF) : -1.0f;
+    // The same, as pipeline constants of the pixel shader (render.h PipelineKey).
+    d.pipe.alphaFunc = uint8_t(misc.alphaRef[1]);
+    d.pipe.alphaToMask = misc.alphaRef[3] != 0.0f;
+    d.pipe.pgenReg = misc.paramGen[0] >= 0.0f ? uint8_t(misc.paramGen[0]) : 0xFF;
+    d.pipe.noDepthAttachment = 0;
     misc.paramGen[1] = (Reg(0x2302) & 1) ? 0.0f : 0.5f;
     misc.paramGen[2] = 16384.0f; // state-machine shaders' step cap (see xenos_wgsl.cpp)
+    // Guest samples per host texel (the backend may render this target smaller,
+    // render::TargetScale): pixel positions are reported in guest pixels.
+    misc.paramGen[3] = 1.0f / render::TargetScale(d.depth.pitch);
 
     // Scissor: window scissor (offset by the window offset unless disabled)
     // intersected with the screen scissor.
@@ -1453,6 +1509,7 @@ void RecordDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize,
                 {
                     misc.texcoordScale[slot][0] = float(t.width) / float(rs->second.w);
                     misc.texcoordScale[slot][1] = float(t.height) / float(rs->second.h);
+                    misc.texelScale[slot] = rs->second.scale;
                     // Raw 7e3 bit patterns (light buffers): blending neighbours'
                     // bits gives nonsense where their exponents differ (banded
                     // blotches on skin); sample the nearest texel.

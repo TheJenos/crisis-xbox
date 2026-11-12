@@ -31,6 +31,10 @@ void PlatformSleepMsPrecise(uint32_t ms); // for the title's own sleeps: no time
 // runs with DUMP_DIR); native writes the file into the working directory.
 void PlatformUploadDump(const char* name, const void* data, size_t size);
 void PlatformYield();
+// Block while the 32-bit word at `p` still holds `expected`, until another
+// thread calls PlatformWakeWord(p) or about `ms` pass (may return early).
+void PlatformWaitWord(volatile uint32_t* p, uint32_t expected, double ms);
+void PlatformWakeWord(volatile uint32_t* p);
 uint64_t PlatformCounterNs();      // monotonic
 int64_t PlatformFileTimeNow();     // 100 ns units since 1601-01-01 UTC
 

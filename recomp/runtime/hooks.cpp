@@ -98,15 +98,7 @@ TRACE_HOOK(82312DD0, "flash [10]")
 TRACE_HOOK(82312E98, "flash [11]")
 TRACE_HOOK(82313060, "flash [12]")
 TRACE_HOOK(82313138, "flash [13]")
-extern "C" PPC_FUNC(__imp__sub_82313218);
-PPC_FUNC(sub_82313218)
-{
-    static std::atomic<int> calls{ 0 };
-    int n = calls++;
-    if (g_traceHooks && (n < 10 || n % 300 == 0))
-        Log("hook: flash Advance #%d player %08X dt %f from %08llX", n, ctx.r3.u32, ctx.f1.f64, ctx.lr);
-    __imp__sub_82313218(ctx, base);
-}
+// [14] (sub_82313218) is Advance: hooked in prompts.cpp.
 TRACE_HOOK(823132E0, "flash [15]")
 TRACE_HOOK(82316AE8, "flash [16]")
 TRACE_HOOK(82310A88, "flash [21]")
@@ -847,4 +839,140 @@ PPC_FUNC(sub_8233A2D8)
     if (g_saveTrace && pending)
         Log("save trace: commit pass ->%s %u, user 0 still pending %u", list.empty() ? "" : " (streams open!)", ctx.r3.u32,
             Load<uint8_t>(self + 1868 + 621));
+}
+
+// D3D's wait for the GPU (render thread): one pass of the title's polling loop,
+// 32 short delay instructions and then a check of the GPU's progress, called
+// over and over until the GPU (the emulated command processor) catches up.
+// Spinning there took a whole core; on phones, with few fast cores, that core
+// was missing for the threads doing the work. Yield first: PlatformYield waits
+// 50 us where the browser times short waits well (phones), and does nothing
+// on Windows, so desktop timing is unchanged.
+extern "C" PPC_FUNC(__imp__sub_836E0B60);
+PPC_FUNC(sub_836E0B60)
+{
+    PlatformYield();
+    __imp__sub_836E0B60(ctx, base);
+}
+
+// D3D's kick-off (render thread): it writes the ring buffer's write pointer
+// (GPU register CP_RB_WPTR) for the command processor, which now waits for
+// that instead of polling.
+void GpuKickedOff();
+extern "C" PPC_FUNC(__imp__sub_836DE880);
+PPC_FUNC(sub_836DE880)
+{
+    __imp__sub_836DE880(ctx, base);
+    GpuKickedOff();
+}
+
+// The render thread's handshake with the main thread (CryEngine's
+// SRenderThread at r3: +32 m_nFlush, 1 while a frame's commands wait to be
+// processed; +16 the quit flag). Both sides polled the flag: the render thread
+// with Sleep(0), which does nothing in the browser, so it kept a core running
+// flat out (on a 6-core PC, often the core the main thread shared, the thread
+// that limits the frame rate); the main thread with Sleep(1), each a trip
+// through the sleep timer. They now wait on the flag's word and wake each
+// other where the title changes it. The originals still run afterwards and
+// find the flag as they expect.
+//   sub_828CBA58 main thread: hands over a frame, sets the flag at its end
+//   sub_828CB7C0 main thread: waits for the flag to clear (FlushAndWait sets it just before)
+//   sub_828CB830 render thread: waits for the flag
+//   sub_828D01A0 render thread: processes the frame, clears the flag at its end
+namespace
+{
+    volatile uint32_t* FlushWord(uint32_t self) { return (volatile uint32_t*)GuestPtr(self + 32); }
+    bool RenderQuit(uint32_t self) { return Load<uint8_t>(self + 16) != 0; }
+    // While the renderer shows a loading screen (flag 0x1000 at +18520 of the
+    // renderer, 0x83AE42B0), the render thread's wait also redraws it on a
+    // timer: leave that wait as it was.
+    bool LoadingScreenWait()
+    {
+        uint32_t r = Load<uint32_t>(0x83AE42B0);
+        return r && (Load<uint32_t>(r + 18520) & 0x1000) && !Load<uint8_t>(r + 19580);
+    }
+}
+extern "C" PPC_FUNC(__imp__sub_828CBA58);
+PPC_FUNC(sub_828CBA58)
+{
+    uint32_t self = ctx.r3.u32;
+    __imp__sub_828CBA58(ctx, base);
+    PlatformWakeWord(FlushWord(self));
+}
+extern "C" PPC_FUNC(__imp__sub_828CB7C0);
+PPC_FUNC(sub_828CB7C0)
+{
+    uint32_t self = ctx.r3.u32;
+    PlatformWakeWord(FlushWord(self));
+    for (uint32_t v; (v = *FlushWord(self)) != 0 && !RenderQuit(self);)
+        PlatformWaitWord(FlushWord(self), v, 2.0);
+    __imp__sub_828CB7C0(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_828CB830);
+PPC_FUNC(sub_828CB830)
+{
+    uint32_t self = ctx.r3.u32;
+    while (*FlushWord(self) == 0 && !RenderQuit(self) && !LoadingScreenWait())
+        PlatformWaitWord(FlushWord(self), 0, 2.0);
+    __imp__sub_828CB830(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_828D01A0);
+PPC_FUNC(sub_828D01A0)
+{
+    uint32_t self = ctx.r3.u32;
+    __imp__sub_828D01A0(ctx, base);
+    PlatformWakeWord(FlushWord(self));
+}
+
+// The main thread's occlusion test (r3: the coverage buffer) first waits for
+// the job that rasterizes the buffer (+84 nonzero while it runs): up to 20
+// times Sleep(1). In the browser each of those sleeps took ~1-6 ms, the main
+// thread's time, and the main thread limits the frame rate. Watch the flag
+// for up to 20 ms instead (yielding); the original then finds it clear, or
+// waits and gives up as before.
+extern "C" PPC_FUNC(__imp__sub_82A31BC8);
+PPC_FUNC(sub_82A31BC8)
+{
+    uint32_t busy = ctx.r3.u32 + 84;
+    if (Load<uint32_t>(busy) != 0)
+    {
+        uint64_t until = PlatformCounterNs() + 20000000ull;
+        while (Load<uint32_t>(busy) != 0 && PlatformCounterNs() < until)
+            PlatformYield();
+    }
+    __imp__sub_82A31BC8(ctx, base);
+}
+
+// The title's frame limiter (render thread, sys_MaxFPS): it waits until
+// last + int(1000 / (fps + 0.5)) * 100 timer ticks (1/100000 s) by reading the
+// game timer in a busy loop, so a capped frame rate kept a core running flat
+// out (phones: battery and heat). Sleep most of the wait instead; the original
+// then spins only the last 2 ms, so the frame timing stays the game's.
+//   0x83C42800 gEnv (pTimer at +20), 0x83AD7358 the sys_MaxFPS ICVar,
+//   0x83AD735C flags (bit 1: 0x83AD7350, the last frame's time, is set).
+extern "C" PPC_FUNC(__imp__sub_82883F80);
+PPC_FUNC(sub_82883F80)
+{
+    uint32_t env = Load<uint32_t>(0x83C42800), cvar = Load<uint32_t>(0x83AD7358);
+    uint32_t timer = env ? Load<uint32_t>(env + 20) : 0;
+    if (timer && cvar && (Load<uint32_t>(0x83AD735C) & 2))
+    {
+        PPCContext c = ctx;
+        c.r3.u32 = cvar;
+        GuestCall(c, Load<uint32_t>(Load<uint32_t>(cvar) + 8)); // ICVar::GetIValue
+        int fps = c.r3.s32;
+        if (fps > 0)
+        {
+            c = ctx;
+            c.r1.u32 = ctx.r1.u32 - 512; // (scratch frame below the caller's)
+            c.r3.u32 = c.r1.u32 + 128;   // CTimeValue result
+            c.r4.u32 = timer;
+            GuestCall(c, Load<uint32_t>(Load<uint32_t>(timer) + 20)); // ITimer::GetAsyncTime
+            int64_t now = Load<int64_t>(c.r3.u32), last = Load<int64_t>(0x83AD7350);
+            int64_t left = last + int64_t(int(1000.0f / (float(fps) + 0.5f))) * 100 - now; // ticks of 10 us
+            if (left > 300 && left < 100000) // more than 3 ms (and sane: under a second)
+                PlatformSleepMsPrecise(uint32_t((left - 200) / 100));
+        }
+    }
+    __imp__sub_82883F80(ctx, base);
 }
