@@ -94,12 +94,13 @@ Anyone who opens the page can read the session and player lists, and WebRTC
 connection offers include the player's network addresses.
 
 What works so far: the multiplayer menus, Quick Match finding a session hosted
-in another browser and joining it, with both players listed in its lobby
-(internet link), and a private match loading its map for the host alone. Not
-done yet: Quick Match waits for its minimum number of players, so two players
-alone don't reach a match; the host doesn't answer a join over the `?mp=local`
-link; no TURN server (some networks block direct connections); no host
-migration or leaderboards.
+in another browser, and a private match loading its map for the host alone.
+Joining works only some of the time: in one two-tab run over the internet link
+both players were listed in the host's lobby; in the others the host receives
+the join requests but never answers, and the joining player stays on
+"Attempting to join session". Not done yet: Quick Match waits for its minimum
+number of players, so two players alone don't reach a match; no TURN server
+(some networks block direct connections); no host migration or leaderboards.
 
 ## Debugging
 

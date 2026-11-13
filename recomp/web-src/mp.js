@@ -145,9 +145,11 @@
     }
 
     // This player and its sessions, kept fresh (stale ones are ignored after 20 s).
-    const beat = () => {
+    const putPlayer = () =>
       fetch(url(`players/${idHex}`), { method: 'PUT', body: JSON.stringify({ name, status, t: stamp }) })
         .then((r) => r.json()).then((v) => { if (v && typeof v.t === 'number') skew = v.t - Date.now(); }).catch(() => {});
+    const beat = () => {
+      putPlayer();
       for (const [key, line] of mine) put(`sessions/${key}`, { host: idHex, name, line, t: stamp });
       refreshListed();
     };
@@ -253,7 +255,7 @@
         del(`players/${idHex}`, true);
         for (const p of peers.values()) try { p.pc.close(); } catch (e) {}
       },
-      setStatus: () => beat(),
+      setStatus: () => putPlayer(),
     };
   }
 
@@ -301,6 +303,10 @@
       addEventListener('pagehide', () => link && link.leave());
     },
     stats: () => ({ ...stats, listed: listed.size, hosting: mine.size }),
-    setStatus(s) { status = s; if (link && link.setStatus) link.setStatus(); },
+    // Called by the game (MAIN_THREAD_ASYNC_EM_ASM). Such calls can run inside
+    // the page thread's wait for a lock (Emscripten handles queued calls while
+    // it waits), so nothing here may call back into the game: the update runs
+    // from the event loop, and it only writes this player's record.
+    setStatus(s) { status = s; setTimeout(() => { if (link && link.setStatus) link.setStatus(); }, 0); },
   };
 })();
