@@ -6,12 +6,14 @@
 // before leaving their first screen, and system UI calls complete
 // immediately with a default answer.
 #include "guest.h"
+#include "mp.h"
 #include "input.h"
 #include "platform.h"
 
 #include <deque>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 
 void FsMountContent(const std::string& drive, const std::string& discDir);
@@ -26,8 +28,9 @@ namespace
                        X_ERROR_NO_SUCH_USER = 0x525, X_ERROR_EMPTY = 0x10D2;
     constexpr uint32_t X_E_SUCCESS = 0, X_E_INVALIDARG = 0x80070057, X_E_NO_SUCH_USER = 0x80070525;
 
-    constexpr uint64_t kXuid = 0xE000000012345678ull; // offline profile
-    const char* kGamertag = "Player";
+    constexpr uint64_t kXuid = 0xE000000012345678ull; // offline profile (saves belong to it: never changes)
+    // The gamertag: the multiplayer name (MP_NAME) when signed in to LIVE.
+    std::string Gamertag() { return MpEnabled() ? MpGamertag() : std::string("Player"); }
 
     // XAM_OVERLAPPED: result, length, context, event, completion routine,
     // completion context, extended error.
@@ -133,29 +136,46 @@ GUEST_IMPORT(XNotifyPositionUI) {}
 GUEST_IMPORT(XNotifyDelayUI) { ctx.r3.u64 = 0; }
 
 // ---------------------------------------------------------------------------
-// Users: user 0 is signed in locally.
+// Users: user 0 is signed in locally. LIVE=1 (multiplayer groundwork; off by
+// default): signed in to Xbox LIVE instead, with the online privileges, so
+// the title goes on into its multiplayer code and the LIVE services it needs
+// show up in the log.
 // ---------------------------------------------------------------------------
-GUEST_IMPORT(XamUserGetSigninState) { ctx.r3.u64 = ctx.r3.u32 == 0 ? 1 : 0; }
+static bool LiveProfile() { return MpEnabled(); }
+GUEST_IMPORT(XamUserGetSigninState) { ctx.r3.u64 = ctx.r3.u32 == 0 ? (LiveProfile() ? 2 : 1) : 0; }
+
+// The profile's XUID for a type mask (1 offline, 2 online). Signed in to LIVE
+// (multiplayer), both come from the player's ID: the title puts the offline
+// one in its join requests, and a host ignores a request carrying its own
+// XUID (two players with the fixed one never got past "joining"). Saves don't
+// depend on it (XamContentGetCreator says the player made every save).
+static uint64_t ProfileXuid(uint32_t typeMask)
+{
+    if (!LiveProfile())
+        return kXuid;
+    return MpXuid((typeMask & 2) != 0);
+}
 
 // HRESULT XamUserGetXUID(u32 user, u32 typeMask, u64* xuid)
 GUEST_IMPORT(XamUserGetXUID)
 {
-    uint32_t user = ctx.r3.u32, ptr = ctx.r5.u32;
+    uint32_t user = ctx.r3.u32, typeMask = ctx.r4.u32, ptr = ctx.r5.u32;
     if (!ptr) { ctx.r3.u64 = X_E_INVALIDARG; return; }
-    Store<uint64_t>(ptr, user == 0 ? kXuid : 0);
+    Store<uint64_t>(ptr, user == 0 ? ProfileXuid(typeMask) : 0);
     ctx.r3.u64 = user == 0 ? X_E_SUCCESS : user < 4 ? X_E_NO_SUCH_USER : X_E_INVALIDARG;
 }
 
 // HRESULT XamUserGetSigninInfo(u32 user, u32 flags, X_USER_SIGNIN_INFO* info): xuid, unk, state, unk, unk, name[16]
 GUEST_IMPORT(XamUserGetSigninInfo)
 {
-    uint32_t user = ctx.r3.u32, info = ctx.r5.u32;
+    uint32_t user = ctx.r3.u32, flags = ctx.r4.u32, info = ctx.r5.u32;
     if (!info) { ctx.r3.u64 = X_E_INVALIDARG; return; }
     memset(GuestPtr(info), 0, 40);
     if (user != 0) { ctx.r3.u64 = X_E_NO_SUCH_USER; return; }
-    Store<uint64_t>(info, kXuid);
-    Store<uint32_t>(info + 12, 1);
-    memcpy(GuestPtr(info + 24), kGamertag, strlen(kGamertag));
+    Store<uint64_t>(info, ProfileXuid(flags));
+    Store<uint32_t>(info + 12, LiveProfile() ? 2 : 1);
+    std::string tag = Gamertag();
+    memcpy(GuestPtr(info + 24), tag.data(), std::min<size_t>(tag.size(), 15));
     ctx.r3.u64 = X_E_SUCCESS;
 }
 
@@ -169,18 +189,25 @@ GUEST_IMPORT(XamUserGetName)
     if (buf && n)
     {
         memset(GuestPtr(buf), 0, n);
-        memcpy(GuestPtr(buf), kGamertag, std::min<size_t>(strlen(kGamertag), n - 1));
+        std::string tag = Gamertag();
+        memcpy(GuestPtr(buf), tag.data(), std::min<size_t>(tag.size(), n - 1));
     }
     ctx.r3.u64 = X_ERROR_SUCCESS;
 }
 
-// u32 XamUserCheckPrivilege(u32 user, u32 mask, u32* result): deny online privileges
+// u32 XamUserCheckPrivilege(u32 user, u32 mask, u32* result): online privileges denied (granted with LIVE=1)
 GUEST_IMPORT(XamUserCheckPrivilege)
 {
     uint32_t user = ctx.r3.u32, out = ctx.r5.u32;
     if (user != 0xFF && user >= 4) { ctx.r3.u64 = X_ERROR_INVALID_PARAMETER; return; }
     if (user != 0xFF && user != 0) { ctx.r3.u64 = X_ERROR_NO_SUCH_USER; return; }
-    if (out) Store<uint32_t>(out, 0);
+    if (out) Store<uint32_t>(out, LiveProfile() ? 1 : 0);
+    if (LiveProfile())
+    {
+        static int logged = 0;
+        if (logged++ < 8)
+            Log("XAM: privilege %u checked: granted (LIVE=1)", ctx.r4.u32);
+    }
     ctx.r3.u64 = X_ERROR_SUCCESS;
 }
 
@@ -366,9 +393,45 @@ GUEST_IMPORT(XamEnableInactivityProcessing) { ctx.r3.u64 = 0; }
 // ---------------------------------------------------------------------------
 static uint32_t DispatchAppMessage(uint32_t app, uint32_t message, uint32_t buffer, uint32_t length)
 {
-    static int logged = 0;
-    if (logged++ < 20)
-        Log("XAM: message app %02X id %08X (buffer %08X, %u bytes)", app, message, buffer, length);
+    // Each distinct message is logged the first time (the title repeats some
+    // every frame, which used to fill the log's quota before the rare ones came).
+    {
+        static std::mutex m;
+        static std::set<uint64_t> seen;
+        std::lock_guard lock(m);
+        if (seen.size() < 256 && seen.insert((uint64_t(app) << 32) | message).second)
+        {
+            Log("XAM: message app %02X id %08X (buffer %08X, %u bytes)", app, message, buffer, length);
+            if (getenv("XAM_DUMP") && buffer) // the message's words (layouts)
+            {
+                auto dump = [&](const char* what, uint32_t at, uint32_t n) {
+                    std::string words;
+                    for (uint32_t i = 0; i < std::min<uint32_t>(n, 64); i += 4)
+                    {
+                        char w[12];
+                        snprintf(w, sizeof(w), " %08X", Load<uint32_t>(at + i));
+                        words += w;
+                    }
+                    Log("XAM:   %08X %s:%s", message, what, words.c_str());
+                };
+                if (length && length < 4096)
+                    dump("buffer", buffer, length);
+                else // (in-process calls: two pointer arguments)
+                {
+                    dump("arg1", buffer, 48);
+                    if (length >= 0x40000000 && length < 0xC0000000)
+                        dump("arg2", length, 48);
+                }
+            }
+        }
+    }
+    if (app == 0xFB) // XGI: sessions, contexts, properties (mp.cpp)
+    {
+        bool handled = false;
+        uint32_t r = MpXgiMessage(message, buffer, length, &handled);
+        if (handled)
+            return r;
+    }
     if (app == 0xFE && message == 0x00020021 && buffer) // XamApp: clear the output word
     {
         if (uint32_t out = Load<uint32_t>(buffer + 0x44)) Store<uint32_t>(out, 0);
@@ -378,6 +441,21 @@ static uint32_t DispatchAppMessage(uint32_t app, uint32_t message, uint32_t buff
     {
         Store<uint32_t>(buffer, 1);
         return X_E_SUCCESS;
+    }
+    // XLiveBase requests to Xbox LIVE's services (0x0005xxxx below 0x8000: the
+    // XOnline library's tasks, which fill result records the title then reads).
+    // None is served yet: they fail, as with LIVE unreachable, so the title
+    // takes its "service unavailable" path instead of reading records nobody
+    // wrote (LIVE=1: message 0x0005000F's record held garbage string pointers,
+    // and the main thread crashed copying them in sub_82338D48).
+    if (app == 0xFC && (message >> 16) == 5 && (message & 0xFFFF) < 0x8000)
+    {
+        static std::set<uint32_t> failed;
+        static std::mutex m;
+        std::lock_guard lock(m);
+        if (failed.insert(message).second)
+            Log("XAM: LIVE service request %08X (%u bytes): not served, failing it", message, length);
+        return 0x80004005; // E_FAIL
     }
     return X_E_SUCCESS;
 }
@@ -504,7 +582,7 @@ GUEST_IMPORT(XamContentDelete)
 GUEST_IMPORT(XamContentGetCreator)
 {
     if (ctx.r5.u32) Store<uint32_t>(ctx.r5.u32, 1);
-    if (ctx.r6.u32) Store<uint64_t>(ctx.r6.u32, kXuid);
+    if (ctx.r6.u32) Store<uint64_t>(ctx.r6.u32, ProfileXuid(1));
     ctx.r3.u64 = ctx.r7.u32 ? CompleteOverlapped(ctx.r7.u32, X_ERROR_SUCCESS) : X_ERROR_SUCCESS;
 }
 
@@ -544,11 +622,49 @@ GUEST_IMPORT(XamContentCreateEnumerator)
     ctx.r3.u64 = X_ERROR_SUCCESS;
 }
 
+// XAM enumerators of other apps' items (Xbox LIVE: friends, sessions,
+// marketplace...). Each has a private block of extraSize bytes that the
+// title's online library fills (XamGetPrivateEnumStructureFromHandle) before
+// XamEnumerate sends it to the app. LIVE isn't there: they enumerate nothing.
+namespace
+{
+    struct XamEnum { uint32_t app, openMsg, closeMsg, extra, extraSize, itemCount; };
+    std::mutex g_xamEnumMutex;
+    std::map<uint32_t, XamEnum> g_xamEnums; // by handle
+}
+
 // u32 XamCreateEnumeratorHandle(user, appId, openMsg, closeMsg, extraSize, itemCount, flags, u32* handle)
 GUEST_IMPORT(XamCreateEnumeratorHandle)
 {
-    if (ctx.r10.u32) Store<uint32_t>(ctx.r10.u32, CreateHandle(ObjectKind::Other, KernelAlloc(16)));
+    uint32_t extraSize = ctx.r7.u32;
+    uint32_t extra = KernelAlloc(std::max<uint32_t>(16, (extraSize + 15) & ~15u));
+    if (extra)
+        memset(GuestPtr(extra), 0, std::max<uint32_t>(16, extraSize));
+    uint32_t handle = CreateHandle(ObjectKind::Other, extra);
+    {
+        std::lock_guard lock(g_xamEnumMutex);
+        g_xamEnums[handle] = { ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, extra, extraSize, ctx.r8.u32 };
+    }
+    static int logged = 0;
+    if (logged++ < 20)
+        Log("XAM: enumerator %08X for app %02X (messages %08X/%08X, %u bytes private, %u items)", handle, ctx.r4.u32,
+            ctx.r5.u32, ctx.r6.u32, extraSize, ctx.r8.u32);
+    if (ctx.r10.u32) Store<uint32_t>(ctx.r10.u32, handle);
     ctx.r3.u64 = X_ERROR_SUCCESS;
+}
+
+// u32 XamGetPrivateEnumStructureFromHandle(handle, u32* privateBlock)
+GUEST_IMPORT(XamGetPrivateEnumStructureFromHandle)
+{
+    uint32_t handle = ctx.r3.u32, out = ctx.r4.u32, extra = 0;
+    {
+        std::lock_guard lock(g_xamEnumMutex);
+        auto it = g_xamEnums.find(handle);
+        if (it != g_xamEnums.end())
+            extra = it->second.extra;
+    }
+    if (out) Store<uint32_t>(out, extra);
+    ctx.r3.u64 = extra ? X_ERROR_SUCCESS : X_ERROR_INVALID_PARAMETER;
 }
 
 // u32 XamEnumerate(handle, flags, buffer, bufferSize, u32* itemsReturned, overlapped)

@@ -54,6 +54,7 @@
   // ---- Saved settings -----------------------------------------------------
   const load = (key, fallback) => { try { const v = JSON.parse(localStorage.getItem(key)); return v ?? fallback; } catch (e) { return fallback; } };
   const save = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {} };
+  const mpSettings = () => load('crysisMp', {}) || {}; // (multiplayer, read by mp.js)
   let bindings = clone(DEFAULTS);
   const stored = load('crysisBindings', null);
   if (stored && stored.version === 1 && stored.bindings) bindings = clone(stored.bindings);
@@ -237,7 +238,7 @@
   #settings .field label { width: 210px; flex: none; font-size: 13px; }
   #settings input[type=range] { flex: 1; accent-color: var(--accent); }
   #settings input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; }
-  #settings select { flex: 1; background: #1d2321; color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+  #settings select, #settings input[type="text"] { flex: 1; background: #1d2321; color: var(--text); border: 1px solid var(--line); border-radius: 6px;
     padding: 5px 8px; font: inherit; font-size: 13px; }
   #settings .val { width: 44px; text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); }
   #settings .foot { display: flex; justify-content: space-between; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
@@ -283,6 +284,7 @@
           <button class="tab" type="button" role="tab" data-tab="mouse">Mouse</button>
           <button class="tab" type="button" role="tab" data-tab="display">Display</button>
           <button class="tab" type="button" role="tab" data-tab="saves">Saved games</button>
+          <button class="tab" type="button" role="tab" data-tab="mp">Multiplayer</button>
           <button class="tab" type="button" role="tab" data-tab="storage">Storage</button>
         </div>
         <div class="pages">
@@ -328,6 +330,16 @@
             <div class="field"><label>All saved data</label><span id="set-saves" class="note" style="margin:0;flex:1">…</span>
               <button class="btn" type="button" data-act="delsaves">Delete all</button></div>
             <p class="note">Checkpoints and your game profile, kept in this browser so they come back when you reload. Deleting them starts the game fresh. The page reloads.</p>
+          </section>
+          <section class="page" role="tabpanel" data-page="mp">
+            <h3>Online play (experimental)</h3>
+            <div class="field"><label for="set-mp">Play online</label><input type="checkbox" id="set-mp"></div>
+            <div class="field"><label for="set-mp-name">Gamertag</label>
+              <input type="text" id="set-mp-name" maxlength="15" spellcheck="false" autocomplete="off" style="flex:1"></div>
+            <div class="field"><label for="set-mp-link">Connection</label>
+              <select id="set-mp-link"><option value="online">Internet (other players, through Firebase)</option><option value="local">Tabs of this browser (testing)</option></select></div>
+            <p class="note" id="set-mp-note">Signs you in to the game's Xbox LIVE multiplayer: Quick Match finds the sessions other players of this page host and joins them. Quick Match waits for enough players before a match starts. Your gamertag, your status and the sessions you host are shared through the Firebase database; the game itself connects player to player (WebRTC). Changes apply after a reload.</p>
+            <p class="note" id="set-mp-id"></p>
           </section>
           <section class="page" role="tabpanel" data-page="storage">
             <h3>Game data in this browser</h3>
@@ -380,6 +392,18 @@
     });
     // The frame-rate meter, fullscreen and screen settings (index.html) apply at once.
     const setVideo = (change) => save('crysisVideo', Object.assign(load('crysisVideo', {}) || {}, change));
+    // Multiplayer (mp.js reads crysisMp when the page loads).
+    const saveMp = (change) => {
+      save('crysisMp', Object.assign(mpSettings(), change));
+      document.getElementById('set-mp-note').textContent = 'Saved. Reload the page for multiplayer settings to take effect.';
+    };
+    document.getElementById('set-mp').addEventListener('change', (e) => saveMp({ enabled: e.target.checked }));
+    document.getElementById('set-mp-link').addEventListener('change', (e) => saveMp({ link: e.target.value }));
+    document.getElementById('set-mp-name').addEventListener('change', (e) => {
+      const name = e.target.value.replace(/[^A-Za-z0-9 ]/g, '').trim().slice(0, 15);
+      e.target.value = name;
+      saveMp({ name });
+    });
     const showFps = document.getElementById('set-showfps');
     showFps.addEventListener('change', () => {
       setVideo({ showFps: showFps.checked });
@@ -551,6 +575,15 @@
       const hz = window.crysisRefreshHz && crysisRefreshHz();
       document.getElementById('set-fps-match').textContent = hz ? `Match the display (${Math.min(144, Math.max(60, hz))} fps)` : 'Match the display';
       document.getElementById('set-showfps').checked = video.showFps !== false;
+      {
+        const mp = mpSettings(), live = window.crysisMp;
+        document.getElementById('set-mp').checked = !!mp.enabled;
+        document.getElementById('set-mp-link').value = mp.link === 'local' ? 'local' : 'online';
+        document.getElementById('set-mp-name').value = mp.name || (live ? live.name : '');
+        document.getElementById('set-mp-id').textContent = live && live.enabled
+          ? `Online now as ${live.name} (player ${live.id}, ${live.mode === 'local' ? 'tabs of this browser' : 'internet'}).`
+          : 'Online play is off.';
+      }
       document.getElementById('set-autofs').checked = video.autoFullscreen !== false;
       document.getElementById('set-promptkeys').checked = video.promptKeys !== false;
       document.getElementById('set-quality').value = video.quality || (weak ? 'light' : 'full');

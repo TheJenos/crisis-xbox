@@ -17,6 +17,10 @@
 !/recomp/build_web_variant.sh
 !/recomp/build.sh
 !/recomp/serve.py
+!/recomp/firebase/
+# (names the Firebase project; the web config, recomp/firebase-config.json, stays out too)
+/recomp/firebase/.firebaserc
+/recomp/firebase/*.log
 
 !/analysis/
 /analysis/*

@@ -1,0 +1,45 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "c2": {
+      "sessions": {
+        ".read": true,
+        "$key": {
+          ".write": true,
+          ".validate": "!newData.exists() || newData.hasChildren(['host', 'line', 't'])",
+          "host": { ".validate": "newData.isString() && newData.val().matches(/^[0-9a-f]{6}$/)" },
+          "name": { ".validate": "newData.isString() && newData.val().length <= 15" },
+          "line": { ".validate": "newData.isString() && newData.val().length <= 4096" },
+          "t": { ".validate": "newData.isNumber() && newData.val() <= now + 60000" },
+          "$other": { ".validate": false }
+        }
+      },
+      "players": {
+        ".read": true,
+        "$id": {
+          ".write": true,
+          ".validate": "$id.matches(/^[0-9a-f]{6}$/) && (!newData.exists() || newData.hasChildren(['name', 't']))",
+          "name": { ".validate": "newData.isString() && newData.val().length <= 15" },
+          "status": { ".validate": "newData.isString() && newData.val().length <= 32" },
+          "t": { ".validate": "newData.isNumber() && newData.val() <= now + 60000" },
+          "$other": { ".validate": false }
+        }
+      },
+      "signal": {
+        "$to": {
+          ".read": true,
+          "$msg": {
+            ".write": true,
+            ".validate": "$to.matches(/^[0-9a-f]{6}$/) && (!newData.exists() || newData.hasChildren(['from', 'type']))",
+            "from": { ".validate": "newData.isString() && newData.val().matches(/^[0-9a-f]{6}$/)" },
+            "type": { ".validate": "newData.val() === 'hello' || newData.val() === 'offer' || newData.val() === 'answer' || newData.val() === 'cand'" },
+            "sdp": { ".validate": "newData.isString() && newData.val().length <= 20000" },
+            "cand": { ".validate": "newData.isString() && newData.val().length <= 2000" },
+            "$other": { ".validate": false }
+          }
+        }
+      }
+    }
+  }
+}

@@ -12,6 +12,7 @@
 // stack (StackArg32 index 8 = 9th guest argument).
 #include "guest.h"
 #include "platform.h"
+#include "mp.h"
 
 #include <deque>
 #include <map>
@@ -30,6 +31,7 @@ namespace
     {
         std::vector<uint8_t> data;
         uint16_t fromPort;
+        uint32_t fromIp = LOOPBACK;
     };
 
     // An overlapped WSARecvFrom waiting for data.
@@ -69,14 +71,14 @@ namespace
 
     uint16_t PortOf(uint32_t sockaddr) { return sockaddr ? Load<uint16_t>(sockaddr + 2) : 0; } // sockaddr_in.sin_port (big-endian = guest order)
 
-    void WriteSockaddr(uint32_t addr, uint32_t lenPtr, uint16_t port)
+    void WriteSockaddr(uint32_t addr, uint32_t lenPtr, uint16_t port, uint32_t ip = LOOPBACK)
     {
         if (!addr)
             return;
         memset(GuestPtr(addr), 0, 16);
         Store<uint16_t>(addr + 0, 2); // AF_INET
         Store<uint16_t>(addr + 2, port);
-        Store<uint32_t>(addr + 4, LOOPBACK);
+        Store<uint32_t>(addr + 4, ip);
         if (lenPtr)
             Store<uint32_t>(lenPtr, 16);
     }
@@ -128,7 +130,7 @@ namespace
     }
 
     // Deliver a datagram from `fromPort` to the socket bound to `toPort` (caller holds g_mutex).
-    void Deliver(uint16_t fromPort, uint16_t toPort, std::vector<uint8_t> data)
+    void Deliver(uint16_t fromPort, uint16_t toPort, std::vector<uint8_t> data, uint32_t fromIp = LOOPBACK)
     {
         Socket* target = BoundTo(toPort);
         if (!target)
@@ -142,18 +144,41 @@ namespace
         if (n <= 16 || (n & (n - 1)) == 0)
             Log("net: datagram %llu: %u -> %u, %zu bytes (%s)", (unsigned long long)n, fromPort, toPort, data.size(),
                 target->pending.empty() ? "queued" : "completes a pending receive");
-        Datagram d{ std::move(data), fromPort };
+        Datagram d{ std::move(data), fromPort, fromIp };
         if (!target->pending.empty())
         {
             PendingRecv r = target->pending.front();
             target->pending.pop_front();
             uint32_t n = CopyToBufs(d, r.bufs, r.bufCount);
-            WriteSockaddr(r.from, r.fromLen, d.fromPort);
+            WriteSockaddr(r.from, r.fromLen, d.fromPort, d.fromIp);
             CompleteOverlapped(r.overlapped, n);
             return;
         }
         target->queue.push_back(std::move(d));
     }
+
+    // A datagram from this machine's port to `to` (a sockaddr_in): to another
+    // player through the page when it's their address (multiplayer), else to a
+    // socket here (caller holds g_mutex).
+    void Route(uint16_t fromPort, uint32_t to, std::vector<uint8_t> data)
+    {
+        uint32_t ip = to ? Load<uint32_t>(to + 4) : 0;
+        if (MpEnabled() && ip && ip != LOOPBACK && ip != MpOwnIp() && ip != 0xFFFFFFFF)
+        {
+            MpSendPacket(MpOwnIp(), fromPort, ip, PortOf(to), data.data(), data.size());
+            return;
+        }
+        Deliver(fromPort, PortOf(to), std::move(data), ip == MpOwnIp() ? ip : LOOPBACK);
+    }
+}
+
+// A datagram from another player (the page): to the socket bound to `toPort`.
+extern "C" void crysis_net_receive(uint32_t fromIp, uint32_t fromPort, uint32_t toPort, const uint8_t* data, uint32_t size)
+{
+    if (!MpInSession())
+        return;
+    std::lock_guard lock(g_mutex);
+    Deliver(uint16_t(fromPort), uint16_t(toPort), std::vector<uint8_t>(data, data + size), fromIp);
 }
 
 // int WSAStartup(u16 version, WSADATA* data)
@@ -170,12 +195,75 @@ GUEST_IMPORT(NetDll_WSAStartup)
 }
 
 GUEST_IMPORT(NetDll_WSACleanup) { ctx.r3.u64 = 0; }
+// u32 XNetLogonGetTitleID(u32): the running title's ID. (The title calls it
+// with 5, then sends the ID to XAM's online service.)
+GUEST_IMPORT(XNetLogonGetTitleID) { ctx.r3.u64 = g_xex.titleId; }
+
+// HRESULT XNetLogonGetMachineID(u64* machineId): the console's ID on Xbox LIVE.
+// Machine IDs start with 0xFA; the rest is fixed for now (one machine).
+GUEST_IMPORT(XNetLogonGetMachineID)
+{
+    if (ctx.r3.u32)
+        Store<uint64_t>(ctx.r3.u32, 0xFA00000000C0FFEEull);
+    ctx.r3.u64 = 0;
+}
+
 GUEST_IMPORT(NetDll_XNetStartup) { ctx.r3.u64 = 0; }
 GUEST_IMPORT(NetDll_XNetCleanup) { ctx.r3.u64 = 0; }
 GUEST_IMPORT(NetDll_WSAGetLastError) { ctx.r3.u64 = t_lastError; }
 
-// XNET_GET_XNADDR_*: 0 = pending. Report the cable as disconnected.
-GUEST_IMPORT(NetDll_XNetGetConnectStatus) { ctx.r3.u64 = 0; }
+// Secure-network addresses. A player's XNADDR and IP map to each other
+// directly (mp.cpp: the XNADDR follows from the IP), so there's nothing to
+// register, connect or look up. NetDll_* take the caller first (r3).
+// int XNetXnAddrToInAddr(caller, const XNADDR*, const XNKID*, IN_ADDR* out)
+GUEST_IMPORT(NetDll_XNetXnAddrToInAddr)
+{
+    uint32_t ip = MpIpOfXnAddr(ctx.r4.u32);
+    if (ctx.r6.u32) Store<uint32_t>(ctx.r6.u32, ip);
+    static std::atomic<int> logged{ 0 };
+    if (logged++ < 10)
+        Log("net: XNetXnAddrToInAddr -> %u.%u.%u.%u", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
+    ctx.r3.u64 = ip ? 0 : WSAEINVAL;
+}
+
+// int XNetInAddrToXnAddr(caller, IN_ADDR, XNADDR* out, XNKID* out)
+GUEST_IMPORT(NetDll_XNetInAddrToXnAddr)
+{
+    uint32_t ip = ctx.r4.u32;
+    if (ip == LOOPBACK) ip = MpOwnIp();
+    static std::atomic<int> logged{ 0 };
+    if (logged++ < 10)
+        Log("net: XNetInAddrToXnAddr(%u.%u.%u.%u)", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
+    if (ctx.r5.u32) { uint8_t x[36]; MpXnAddr(ip, x); memcpy(GuestPtr(ctx.r5.u32), x, 36); }
+    if (ctx.r6.u32) { uint8_t k[8]; MpSessionKeyFor(ip, k); memcpy(GuestPtr(ctx.r6.u32), k, 8); }
+    ctx.r3.u64 = 0;
+}
+
+GUEST_IMPORT(NetDll_XNetUnregisterInAddr) { ctx.r3.u64 = 0; }
+GUEST_IMPORT(NetDll_XNetConnect)
+{
+    static std::atomic<int> logged{ 0 };
+    if (logged++ < 10)
+        Log("net: XNetConnect(%u.%u.%u.%u)", ctx.r4.u32 >> 24, (ctx.r4.u32 >> 16) & 255, (ctx.r4.u32 >> 8) & 255, ctx.r4.u32 & 255);
+    ctx.r3.u64 = 0;
+}
+
+// DWORD XNetGetConnectStatus(caller, IN_ADDR): XNET_CONNECT_STATUS_CONNECTED (2):
+// every player is reachable once listed (the page connects on first packet).
+GUEST_IMPORT(NetDll_XNetGetConnectStatus) { ctx.r3.u64 = MpEnabled() ? 2 : 0; }
+
+// LSP servers and DNS: there are none.
+GUEST_IMPORT(NetDll_XNetServerToInAddr) { ctx.r3.u64 = WSAEINVAL; }
+GUEST_IMPORT(NetDll_XNetDnsLookup) { if (ctx.r6.u32) Store<uint32_t>(ctx.r6.u32, 0); ctx.r3.u64 = WSAEINVAL; }
+GUEST_IMPORT(NetDll_XNetDnsRelease) { ctx.r3.u64 = 0; }
+
+// u32 inet_addr(caller, const char*): dotted IPv4, network order.
+GUEST_IMPORT(NetDll_inet_addr)
+{
+    std::string sAddr = ctx.r4.u32 ? LoadGuestString(ctx.r4.u32, 32) : "";
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    ctx.r3.u64 = sscanf(sAddr.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) == 4 ? (a << 24 | b << 16 | c << 8 | d) : 0xFFFFFFFF;
+}
 
 // SOCKET socket(int af, int type, int protocol): datagram sockets only.
 GUEST_IMPORT(NetDll_socket)
@@ -253,7 +341,7 @@ GUEST_IMPORT(NetDll_sendto)
     if (!s->port)
         while (BoundTo(s->port = g_nextPort++) != s) {}
     const uint8_t* p = (const uint8_t*)GuestPtr(ctx.r5.u32);
-    Deliver(s->port, PortOf(ctx.r8.u32), std::vector<uint8_t>(p, p + ctx.r6.u32));
+    Route(s->port, ctx.r8.u32, std::vector<uint8_t>(p, p + ctx.r6.u32));
     ctx.r3.u64 = ctx.r6.u32;
 }
 
@@ -268,7 +356,7 @@ GUEST_IMPORT(NetDll_WSASendTo)
         while (BoundTo(s->port = g_nextPort++) != s) {}
     std::vector<uint8_t> data = GatherBufs(ctx.r5.u32, ctx.r6.u32);
     uint32_t size = uint32_t(data.size());
-    Deliver(s->port, PortOf(ctx.r9.u32), std::move(data));
+    Route(s->port, ctx.r9.u32, std::move(data));
     if (ctx.r7.u32) Store<uint32_t>(ctx.r7.u32, size);
     uint32_t ov = StackArg32(ctx, 8);
     if (ov) CompleteOverlapped(ov, size);
@@ -290,7 +378,7 @@ GUEST_IMPORT(NetDll_WSARecvFrom)
         Datagram d = std::move(s->queue.front());
         s->queue.pop_front();
         uint32_t n = CopyToBufs(d, bufs, count);
-        WriteSockaddr(from, fromLen, d.fromPort);
+        WriteSockaddr(from, fromLen, d.fromPort, d.fromIp);
         if (received) Store<uint32_t>(received, n);
         if (ov) CompleteOverlapped(ov, n);
         ctx.r3.u64 = 0;

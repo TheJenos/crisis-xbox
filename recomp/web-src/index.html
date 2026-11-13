@@ -202,6 +202,7 @@
   <button id="toggle-log" type="button">Log</button>
 </div>
 <pre id="log"></pre>
+<script src="mp.js"></script>
 <script>
   const pageStart = performance.now();
   const $ = (id) => document.getElementById(id);
@@ -660,6 +661,9 @@
       const res = video.res ?? crysisDefaultRes();
       if (res > 0 && res < 1) ENV.RES_SCALE = String(res);
       if (cvars.length) ENV.GAME_CVARS = cvars.join(';');
+      // Multiplayer (Settings, Multiplayer; mp.js): signed in to Xbox LIVE as
+      // this player, with the link to the others.
+      if (window.crysisMp && crysisMp.enabled) Object.assign(ENV, crysisMp.env());
       // Settings, Storage: "Log performance details" (for a diagnostics report).
       try { if (localStorage.getItem('crysisDiag') === '1') ENV.PROFILE = '1'; } catch (e) {}
       for (const kv of new URLSearchParams(location.search).getAll('env')) {
@@ -695,6 +699,7 @@
       if (window.crysisControls) crysisControls.onRuntime(); // mouse settings (controls.js)
     },
   };
+  if (window.crysisMp) crysisMp.attach(Module); // multiplayer link (mp.js)
 
   // ---- Touch controls ----------------------------------------------------
   function pad(fn, ...args) { if (Module[fn]) Module[fn](...args); }
