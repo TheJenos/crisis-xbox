@@ -306,9 +306,9 @@
             <div class="field"><label for="set-fps">Frame rate</label>
               <select id="set-fps"><option value="0" id="set-fps-match">Match the display</option><option value="60">Up to 60 fps</option><option value="120">Up to 120 fps</option><option value="30">30 fps, like the console</option></select></div>
             <p class="note" id="set-fps-note">The console version runs at 30 fps. Computers default to the display's refresh rate (60 to 144); phones, tablets and computers with 4 CPU threads or fewer default to 30: steadier, and it saves battery and heat. Changes apply the next time the game starts (reload the page).</p>
-            <div class="field"><label for="set-quality">Graphics</label>
-              <select id="set-quality"><option value="full">Full, like the console</option><option value="light">Lighter, for phones (fewer shadow passes)</option></select></div>
-            <p class="note" id="set-quality-note">Lighter draws about 14% fewer objects per frame, which phones are limited by. It's the default on phones, tablets and computers with 4 CPU threads or fewer. Changes apply after a reload.</p>
+            <div class="field"><label for="set-quality">Shadows</label>
+              <select id="set-quality"><option value="full">Like the console (5 sun cascades)</option><option value="light">Shorter range (2 cascades), faster</option></select></div>
+            <p class="note" id="set-quality-note">The sun's shadows are drawn in cascades, from near to far. As on the console, the nearest two are redrawn every frame and the far ones are reused until you move on, so shadows never lag behind. Shorter range leaves out the far cascades: about 15% fewer draws per frame (what phones are limited by) and 4 to 9% more frames per second on a fast computer; distant shadows are missing. It's the default on phones, tablets and computers with 4 CPU threads or fewer. Changes apply after a reload.</p>
             <div class="field"><label for="set-res">Resolution</label>
               <select id="set-res"><option value="1">Full, like the console (1152×720)</option><option value="0.75">75%: lighter on the graphics chip</option><option value="0.5">50%: fastest, blurrier</option></select></div>
             <p class="note" id="set-res-note">Renders the game's main picture smaller and scales it up, for integrated graphics and phones. The default is 75% on phones, tablets, small computers and Intel graphics. Changes apply after a reload.</p>
@@ -421,7 +421,7 @@
     const quality = document.getElementById('set-quality');
     quality.addEventListener('change', () => {
       setVideo({ quality: quality.value });
-      document.getElementById('set-quality-note').textContent = 'Saved. Reload the page for the new graphics setting to take effect.';
+      document.getElementById('set-quality-note').textContent = 'Saved. Reload the page for the new shadow setting to take effect.';
     });
     const res = document.getElementById('set-res');
     res.addEventListener('change', () => {

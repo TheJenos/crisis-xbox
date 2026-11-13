@@ -651,10 +651,23 @@
       const fps = choice === 0 ? Math.min(144, Math.max(60, refreshHz || 60)) : choice;
       if (fps !== 30) { ENV.VBLANK_HZ = String(Math.min(240, fps * 2)); cvars.push('sys_MaxFPS=' + fps, 'r_VSync=1'); }
       else cvars.push('sys_MaxFPS=30', 'r_VSync=1');
-      // Graphics (settings): "light" (the default on touch devices) draws two sun
-      // shadow cascades instead of the console's: about 14% fewer draw calls.
+      // Shadows (settings; stored as "quality"): "light" (the default on weak
+      // devices) draws two sun shadow cascades instead of the console's five.
       // Phones are limited by the cost of each draw call (WebGPU in the browser,
-      // then the driver), not by pixels; the picture barely changes.
+      // then the driver), not by pixels. Measured at the pier on a desktop,
+      // uncapped (fps standing / walking, draws per frame):
+      //   console (5 cascades)          62 / 58   1140
+      //   2 cascades ("light")          65 / 63    975
+      //   3 cascades                    62 / 61   1060
+      //   second cascade cached too     65 / 62   1010
+      //   shorter caster distance (0.5) 62 / 64   1030 (no gain with 2 cascades)
+      //   no shadows (e_Shadows=0)      69 / 65    800 (sunlight leaks indoors)
+      // The console already reuses the far cascades between frames (console.cfg:
+      // e_GsmCache=1, e_GsmCacheLodOffset=2; they are redrawn when the camera has
+      // moved on) and redraws the near two every frame. Caching the second one
+      // too (the engine's way to redraw shadows less often) gains about what two
+      // cascades do, but shadows of things moving at mid range then update late,
+      // so it is not offered.
       if ((video.quality || (weakDevice ? 'light' : 'full')) === 'light') cvars.push('e_GsmLodsNum=2');
       // Resolution (settings): the game's full-resolution passes render at this
       // fraction of 1152x720 and the result is scaled up (render::TargetScale).
